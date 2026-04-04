@@ -5,14 +5,19 @@ Monitors Istanbul and Ankara booking pages and notifies when slots open.
 
 import asyncio
 import json
+import os
 import random
 import time
 import winsound
 from datetime import datetime
 from pathlib import Path
 
+import requests
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from plyer import notification
+
+load_dotenv()
 
 
 def load_config():
@@ -20,10 +25,27 @@ def load_config():
         return json.load(f)
 
 
+def send_telegram(message):
+    token = os.environ["TELEGRAM_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[!] Telegram notification failed: {e}")
+
+
 def notify(city, url):
     title = f"Vize Randevusu Acildi! - {city}"
     message = f"{city} icin randevu acildi. Hemen rezervasyon yap!"
 
+    # Telegram
+    send_telegram(f"🚨 <b>RANDEVU ACILDI — {city}</b>\n{url}")
+
+    # Desktop
     try:
         notification.notify(
             title=title,
