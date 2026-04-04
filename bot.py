@@ -5,6 +5,7 @@ Monitors Istanbul and Ankara booking pages and notifies when slots open.
 
 import asyncio
 import json
+import random
 import time
 import winsound
 from datetime import datetime
@@ -129,7 +130,10 @@ async def run():
                 # in case you miss the first one
                 pass
 
-            await asyncio.sleep(interval)
+            jitter = random.uniform(-15, 15)
+            wait = max(30, interval + jitter)
+            print(f"  Next check in {wait:.0f}s...")
+            await asyncio.sleep(wait)
 
 
 if __name__ == "__main__":
