@@ -24,12 +24,34 @@ Field names NOT exposed inline — buried inside `an-makeAppointment.js`, need t
 - JS files: `/PageJs/Macaristan/TR/ankara/an-bir-{saatGetir,tarihGetir,turkiye}.js`, `an-makeAppointment.js`
 - [ ] Fetch `an-makeAppointment.js` to extract field names before implementing auto-book for Ankara
 
+### Date checking API (from tarihGetir.js)
+Direct API endpoint to check available dates without loading the full page:
+```
+POST /Macaristan/TarihGetir
+params: { tabId: AppointmentTabID, countryid: NationalityTabID }
+header: RequestVerificationToken (anti-CSRF, from page hidden input)
+returns: JSON array of available dates as "YYYY-M-D" strings (empty = no slots)
+```
+- [ ] Try calling this API directly for faster, lighter availability checks
+- [ ] Still need to load the page once per session to get `__RequestVerificationToken`
+
+### Form submission flow (from makeAppointment.js)
+Submit endpoint: `POST /tr/istanbul-bireysel-basvuru` (same as page URL)
+Full payload: Nationality, Appointment, TravelDate, TravelSubject, AppointmentDate,
+AppointmentTime, TC ID (obfuscated), reTCKN, passport (obfuscated), name (obfuscated),
+surname (obfuscated), FormNonce, Phone, CompanyName, email (obfuscated), DogumYili,
+rEmail, enteredCode, __RequestVerificationToken, formStartTime, cfToken, recaptchaToken,
+lessThan15Days
+
 ### Shared obstacles
-- [ ] Google reCAPTCHA (Istanbul key: `6Lf22HgrAAAAAP3u20U_HvrMsqmtltl7HcpezMWj`, Ankara key likely in JS file)
-- [ ] Cloudflare Turnstile — harder than reCAPTCHA, likely needs CapSolver or real Chrome CDP approach
-- [ ] `formStartTime` field — they verify form wasn't submitted too fast, need human-like delay
+- [ ] **40-second bot trap** — `if (elapsedTime < 40)` rejects and redirects to google.com. Auto-book MUST wait 40+ seconds after page load
+- [ ] Google reCAPTCHA **v3** (invisible scoring, not checkbox) — action: `appointment_submit`, site key: `6Lf22HgrAAAAAP3u20U_HvrMsqmtltl7HcpezMWj`
+- [ ] Cloudflare Turnstile — token stored in `#cfToken` via `onTurnstileSuccess()` callback
+- [ ] `formStartTime` — set to `Date.now()` on page load, checked server-side (40s minimum)
+- [ ] `FormNonce` — anti-replay token, generated per page load
+- [ ] `enteredCode` — manual verification code the user enters (unknown what generates it)
 - [ ] `/PageJs/security-protection.js` — custom bot protection, unknown checks
-- [ ] nationality, date, time fields — need to inspect tarihGetir.js / saatGetir.js for both cities
+- [ ] Date picker constraint: appointment must be 15-45 days before travel date (unless "İş (Ticari)" business travel)
 
 ## Detection
 - [ ] Add secondary form-presence check as fallback (in case phrase stays in DOM but form also appears) — need real HTML from an open slot to find correct field selectors first
