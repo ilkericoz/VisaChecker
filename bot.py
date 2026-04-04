@@ -154,7 +154,11 @@ async def telegram_command_listener(state, page_lock, config, page):
 
         for update in updates:
             offset = update["update_id"] + 1
-            raw = update.get("message", {}).get("text", "").strip()
+            msg = update.get("message", {})
+            # Only respond to your own chat
+            if str(msg.get("chat", {}).get("id", "")) != os.environ["TELEGRAM_CHAT_ID"]:
+                continue
+            raw = msg.get("text", "").strip()
             cmd = raw.lower()
 
             if cmd == "/screenshot":
