@@ -6,6 +6,7 @@
 - [ ] Re-alert every X minutes if slot is still open (in case first notification is missed)
 
 ## Detection
+- [ ] Add secondary form-presence check as fallback (in case phrase stays in DOM but form also appears) — need real HTML from an open slot to find correct field selectors first
 - [ ] If page structure changes, detection phrase may silently break — add a way to verify detection is still working (e.g. monthly test alert)
 
 ## Bot Detection / Stealth

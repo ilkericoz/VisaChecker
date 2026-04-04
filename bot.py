@@ -123,6 +123,51 @@ def save_daily_snapshot(city, html):
         print(f"  Snapshot saved: {path}")
 
 
+async def get_structure_fingerprint(page):
+    """Extract form element structure — tags, names, types, ids."""
+    return await page.evaluate("""() => {
+        const els = document.querySelectorAll('input, select, textarea, button, form');
+        return Array.from(els).map(el => ({
+            tag: el.tagName,
+            type: el.type || null,
+            name: el.name || null,
+            id: el.id || null,
+        }));
+    }""")
+
+
+def load_fingerprint(city):
+    path = SNAPSHOTS_DIR / f"{city}_fingerprint.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return None
+
+
+def save_fingerprint(city, fingerprint):
+    SNAPSHOTS_DIR.mkdir(exist_ok=True)
+    path = SNAPSHOTS_DIR / f"{city}_fingerprint.json"
+    path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
+
+
+async def check_structure_change(page, city):
+    """Compare current page structure with stored fingerprint. Alert if changed."""
+    current = await get_structure_fingerprint(page)
+    stored = load_fingerprint(city)
+
+    if stored is None:
+        save_fingerprint(city, current)
+        print(f"  Fingerprint saved for {city}")
+        return
+
+    if current != stored:
+        save_fingerprint(city, current)
+        print(f"  [!] Structure change detected for {city}!")
+        send_telegram(
+            f"Page structure changed for {city} — form elements added/removed.\n"
+            f"Check snapshots/{city}_fingerprint.json for details."
+        )
+
+
 async def check_url(page, entry, no_appt_phrase):
     await page.goto(entry["url"], timeout=30_000)
     try:
@@ -139,6 +184,7 @@ async def check_url(page, entry, no_appt_phrase):
         raise RuntimeError(f"Sanity check failed: '{SANITY_PHRASE}' not found — page may not have loaded correctly")
 
     save_daily_snapshot(entry["name"], html)
+    await check_structure_change(page, entry["name"])
     return no_appt_phrase not in text, html
 
 
