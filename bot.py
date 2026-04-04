@@ -9,7 +9,7 @@ import os
 import random
 import time
 import winsound
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 import requests
@@ -19,7 +19,11 @@ from plyer import notification
 
 load_dotenv()
 
-HEARTBEAT_INTERVAL = 6 * 60 * 60  # send "still alive" message every 6 hours
+HEARTBEAT_INTERVAL = 6 * 60 * 60  # 6 hours
+SNAPSHOTS_DIR = Path("snapshots")
+# A phrase that must always be present on a healthy page load.
+# If it's missing the page failed to load properly.
+SANITY_PHRASE = "Randevu"
 
 
 def load_config():
@@ -81,15 +85,40 @@ def notify(city, url, screenshot_path=None):
     print(f"{'='*60}\n")
 
 
+def save_daily_snapshot(city, html):
+    """Save one HTML snapshot per city per day for structure change tracking."""
+    SNAPSHOTS_DIR.mkdir(exist_ok=True)
+    path = SNAPSHOTS_DIR / f"{city}_{date.today()}.html"
+    if not path.exists():
+        path.write_text(html, encoding="utf-8")
+        print(f"  Snapshot saved: {path}")
+
+
 async def check_url(page, entry, no_appt_phrase):
+    """
+    Returns (available, status_message).
+    Raises if the page fails the sanity check.
+    """
     await page.goto(entry["url"], timeout=30_000)
     try:
         await page.wait_for_selector(".preloader, #preloader, .loading-overlay", state="hidden", timeout=10_000)
     except Exception:
         pass
+
+    # Dismiss the 'Onemli Bilgilendirme' popup
+    await page.keyboard.press("Escape")
     await asyncio.sleep(2)
+
     text = await page.evaluate("document.body.innerText")
-    return no_appt_phrase not in text
+    html = await page.content()
+
+    # Sanity check — make sure the page actually loaded
+    if SANITY_PHRASE not in text:
+        raise RuntimeError(f"Sanity check failed: '{SANITY_PHRASE}' not found — page may not have loaded correctly")
+
+    save_daily_snapshot(entry["name"], html)
+
+    return no_appt_phrase not in text, html
 
 
 async def run():
@@ -127,7 +156,7 @@ async def run():
 
             for entry in urls:
                 try:
-                    available = await check_url(page, entry, no_appt_phrase)
+                    available, html = await check_url(page, entry, no_appt_phrase)
                     status = "AVAILABLE !!!" if available else "unavailable"
                     print(f"[{now}] #{check_count} {entry['name']}: {status}")
 
@@ -139,7 +168,6 @@ async def run():
                             screenshot_path = f"{base}.png"
                             await page.screenshot(path=screenshot_path)
                             print(f"  Screenshot: {screenshot_path}")
-                            html = await page.content()
                             Path(f"{base}.html").write_text(html, encoding="utf-8")
                             print(f"  HTML saved:  {base}.html")
 
@@ -147,6 +175,7 @@ async def run():
 
                 except Exception as e:
                     print(f"[{now}] #{check_count} {entry['name']}: ERROR - {e}")
+                    send_telegram(f"Argos error on {entry['name']}: {e}")
 
             # Heartbeat
             if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
