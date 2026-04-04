@@ -5,19 +5,31 @@
 - [ ] Re-alert every X minutes if slot is still open (in case first notification is missed)
 
 ## Auto-Book
-Field names already known from page JS (obfuscated but stable):
+
+### Istanbul
+Field names exposed inline in page source:
 - TC ID:       `ast_0986af`
 - Name:        `asn_a347c0`
 - Surname:     `assn_6fe6d9`
 - Email:       `ase_1bf435`
 - Passport no: `aspassno_fb4560`
-- nationality, date, time fields — need to inspect makeAppointment.js / tarihGetir.js / saatGetir.js
+- Blocked copy/paste fields: `reEmail`, `rEmail`, `rTCKN`
+- reCAPTCHA site key: `6Lf22HgrAAAAAP3u20U_HvrMsqmtltl7HcpezMWj`
+- JS files: `/PageJs/Macaristan/TR/istanbul/{saatGetir,tarihGetir,turkiye,makeAppointment}.js`
 
-Anti-bot obstacles to solve before auto-book works:
-- [ ] Google reCAPTCHA (site key: `6Lf22HgrAAAAAP3u20U_HvrMsqmtltl7HcpezMWj`)
-- [ ] Cloudflare Turnstile — harder than reCAPTCHA, likely needs CapSolver
-- [ ] `formStartTime` field — they check how long the form was open, need human-like delay before submit
+### Ankara
+Field names NOT exposed inline — buried inside `an-makeAppointment.js`, need to fetch and read:
+`https://appointment.as-visa.com/PageJs/Macaristan/TR/ankara/an-makeAppointment.js`
+- Blocked copy/paste fields: `reEmail`, `reTCKN` (slightly different from Istanbul)
+- JS files: `/PageJs/Macaristan/TR/ankara/an-bir-{saatGetir,tarihGetir,turkiye}.js`, `an-makeAppointment.js`
+- [ ] Fetch `an-makeAppointment.js` to extract field names before implementing auto-book for Ankara
+
+### Shared obstacles
+- [ ] Google reCAPTCHA (Istanbul key: `6Lf22HgrAAAAAP3u20U_HvrMsqmtltl7HcpezMWj`, Ankara key likely in JS file)
+- [ ] Cloudflare Turnstile — harder than reCAPTCHA, likely needs CapSolver or real Chrome CDP approach
+- [ ] `formStartTime` field — they verify form wasn't submitted too fast, need human-like delay
 - [ ] `/PageJs/security-protection.js` — custom bot protection, unknown checks
+- [ ] nationality, date, time fields — need to inspect tarihGetir.js / saatGetir.js for both cities
 
 ## Detection
 - [ ] Add secondary form-presence check as fallback (in case phrase stays in DOM but form also appears) — need real HTML from an open slot to find correct field selectors first
