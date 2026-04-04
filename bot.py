@@ -107,9 +107,16 @@ async def run():
                     if available:
                         if config.get("screenshot_on_found"):
                             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            path = Path(f"found_{entry['name']}_{ts}.png")
-                            await page.screenshot(path=str(path))
-                            print(f"  Screenshot: {path}")
+                            base = f"found_{entry['name']}_{ts}"
+
+                            # Screenshot for visual reference
+                            await page.screenshot(path=f"{base}.png")
+                            print(f"  Screenshot: {base}.png")
+
+                            # Full HTML for building auto-book later
+                            html = await page.content()
+                            Path(f"{base}.html").write_text(html, encoding="utf-8")
+                            print(f"  HTML saved:  {base}.html")
 
                         notify(entry["name"], entry["url"])
                         found_any = True
