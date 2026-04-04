@@ -2,8 +2,22 @@
 
 ## Bot Behavior
 - [ ] `/screenshot` should also run availability check and alert if slot found (currently separate from detection logic)
-- [ ] Auto-book when slot is found (need to analyze saved HTML for form structure)
 - [ ] Re-alert every X minutes if slot is still open (in case first notification is missed)
+
+## Auto-Book
+Field names already known from page JS (obfuscated but stable):
+- TC ID:       `ast_0986af`
+- Name:        `asn_a347c0`
+- Surname:     `assn_6fe6d9`
+- Email:       `ase_1bf435`
+- Passport no: `aspassno_fb4560`
+- nationality, date, time fields — need to inspect makeAppointment.js / tarihGetir.js / saatGetir.js
+
+Anti-bot obstacles to solve before auto-book works:
+- [ ] Google reCAPTCHA (site key: `6Lf22HgrAAAAAP3u20U_HvrMsqmtltl7HcpezMWj`)
+- [ ] Cloudflare Turnstile — harder than reCAPTCHA, likely needs CapSolver
+- [ ] `formStartTime` field — they check how long the form was open, need human-like delay before submit
+- [ ] `/PageJs/security-protection.js` — custom bot protection, unknown checks
 
 ## Detection
 - [ ] Add secondary form-presence check as fallback (in case phrase stays in DOM but form also appears) — need real HTML from an open slot to find correct field selectors first
