@@ -75,11 +75,12 @@ async def check_url(page, entry, no_appt_phrase):
 async def run():
     config = load_config()
     urls = config["urls"]
-    interval = config["check_interval_seconds"]
+    interval_min = config["check_interval_min_seconds"]
+    interval_max = config["check_interval_max_seconds"]
     no_appt_phrase = config["no_appointment_phrase"]
 
     print("Visa Appointment Bot started")
-    print(f"Checking every {interval}s for: {', '.join(e['name'] for e in urls)}\n")
+    print(f"Checking every {interval_min//60}-{interval_max//60} min for: {', '.join(e['name'] for e in urls)}\n")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=config["headless"])
@@ -91,6 +92,11 @@ async def run():
             )
         )
         page = await context.new_page()
+
+        # Patch headless tell: hide navigator.webdriver from the site
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
 
         check_count = 0
 
@@ -130,9 +136,8 @@ async def run():
                 # in case you miss the first one
                 pass
 
-            jitter = random.uniform(-15, 15)
-            wait = max(30, interval + jitter)
-            print(f"  Next check in {wait:.0f}s...")
+            wait = random.uniform(interval_min, interval_max)
+            print(f"  Next check in {wait/60:.1f} min...")
             await asyncio.sleep(wait)
 
 
