@@ -19,6 +19,8 @@ from plyer import notification
 
 load_dotenv()
 
+HEARTBEAT_INTERVAL = 6 * 60 * 60  # send "still alive" message every 6 hours
+
 
 def load_config():
     with open("config.json", encoding="utf-8") as f:
@@ -35,21 +37,33 @@ def send_telegram(message):
             timeout=10,
         )
     except Exception as e:
-        print(f"[!] Telegram notification failed: {e}")
+        print(f"[!] Telegram message failed: {e}")
 
 
-def notify(city, url):
-    title = f"Vize Randevusu Acildi! - {city}"
-    message = f"{city} icin randevu acildi. Hemen rezervasyon yap!"
+def send_telegram_photo(path, caption=""):
+    token = os.environ["TELEGRAM_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    try:
+        with open(path, "rb") as f:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"photo": f},
+                timeout=20,
+            )
+    except Exception as e:
+        print(f"[!] Telegram photo failed: {e}")
 
-    # Telegram
-    send_telegram(f"🚨 <b>RANDEVU ACILDI — {city}</b>\n{url}")
 
-    # Desktop
+def notify(city, url, screenshot_path=None):
+    send_telegram(f"RANDEVU ACILDI — {city}\n{url}")
+    if screenshot_path:
+        send_telegram_photo(screenshot_path, caption=f"{city} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
     try:
         notification.notify(
-            title=title,
-            message=message,
+            title=f"Vize Randevusu Acildi! - {city}",
+            message=f"{city} icin randevu acildi. Hemen rezervasyon yap!",
             app_name="Visa Bot",
             timeout=30,
         )
@@ -68,30 +82,14 @@ def notify(city, url):
 
 
 async def check_url(page, entry, no_appt_phrase):
-    """
-    Returns True if an appointment slot is available.
-    Detection: the 'no quota' phrase is absent from the visible page text.
-    """
-    url = entry["url"]
-    city = entry["name"]
-
-    await page.goto(url, timeout=30_000)
-
-    # Wait for the loading spinner to disappear
+    await page.goto(entry["url"], timeout=30_000)
     try:
         await page.wait_for_selector(".preloader, #preloader, .loading-overlay", state="hidden", timeout=10_000)
     except Exception:
         pass
-
-    # Wait a bit for JS to render the content
     await asyncio.sleep(2)
-
     text = await page.evaluate("document.body.innerText")
-
-    if no_appt_phrase in text:
-        return False
-    else:
-        return True
+    return no_appt_phrase not in text
 
 
 async def run():
@@ -104,6 +102,8 @@ async def run():
     print("Visa Appointment Bot started")
     print(f"Checking every {interval_min//60}-{interval_max//60} min for: {', '.join(e['name'] for e in urls)}\n")
 
+    send_telegram(f"Argos started. Checking {', '.join(e['name'] for e in urls)} every {interval_min//60}-{interval_max//60} min.")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=config["headless"])
         context = await browser.new_context(
@@ -114,18 +114,16 @@ async def run():
             )
         )
         page = await context.new_page()
-
-        # Patch headless tell: hide navigator.webdriver from the site
         await page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
         check_count = 0
+        last_heartbeat = time.time()
 
         while True:
             check_count += 1
             now = datetime.now().strftime("%H:%M:%S")
-            found_any = False
 
             for entry in urls:
                 try:
@@ -134,29 +132,26 @@ async def run():
                     print(f"[{now}] #{check_count} {entry['name']}: {status}")
 
                     if available:
+                        screenshot_path = None
                         if config.get("screenshot_on_found"):
                             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                             base = f"found_{entry['name']}_{ts}"
-
-                            # Screenshot for visual reference
-                            await page.screenshot(path=f"{base}.png")
-                            print(f"  Screenshot: {base}.png")
-
-                            # Full HTML for building auto-book later
+                            screenshot_path = f"{base}.png"
+                            await page.screenshot(path=screenshot_path)
+                            print(f"  Screenshot: {screenshot_path}")
                             html = await page.content()
                             Path(f"{base}.html").write_text(html, encoding="utf-8")
                             print(f"  HTML saved:  {base}.html")
 
-                        notify(entry["name"], entry["url"])
-                        found_any = True
+                        notify(entry["name"], entry["url"], screenshot_path)
 
                 except Exception as e:
                     print(f"[{now}] #{check_count} {entry['name']}: ERROR - {e}")
 
-            if found_any:
-                # Keep bot alive so you can still get repeat notifications
-                # in case you miss the first one
-                pass
+            # Heartbeat
+            if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                send_telegram(f"Argos still running. {check_count} checks done, no slots yet.")
+                last_heartbeat = time.time()
 
             wait = random.uniform(interval_min, interval_max)
             print(f"  Next check in {wait/60:.1f} min...")
