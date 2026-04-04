@@ -9,8 +9,8 @@
       "url": "https://appointment.as-visa.com/tr/ankara-bireysel-basvuru"
     }
   ],
-  "check_interval_min_seconds": 180,
-  "check_interval_max_seconds": 600,
+  "check_interval_min_seconds": 60,
+  "check_interval_max_seconds": 120,
   "headless": true,
   "screenshot_on_found": true,
   "no_appointment_phrase": "Aktif Randevu Kotası Bulunmamaktadır"
