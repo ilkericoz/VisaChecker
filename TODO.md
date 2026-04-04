@@ -30,5 +30,32 @@ Anti-bot obstacles to solve before auto-book works:
 - [ ] If actually blocked by reCAPTCHA: integrate 2captcha or CapSolver API (~$1-3/1000 solves) to auto-solve and inject token
 - [ ] If still blocked: residential proxies (~$10-30/month) — last resort
 
+## Defeating Cloudflare Turnstile (for auto-book)
+
+How Turnstile works:
+- Runs silently in background, no visible challenge
+- Checks: browser fingerprint, canvas/WebGL/audio APIs, navigator.webdriver, mouse movement, scroll behavior, keystroke timing, formStartTime, IP reputation, TLS fingerprint
+- Produces a cryptographic token tied to the specific browser session — can't be forged or bought from solving services like reCAPTCHA can
+
+Options to defeat it, best to worst:
+
+**Option 1 — Connect to user's real Chrome (best, free)**
+- Playwright can attach to an already-running Chrome via remote debugging (`playwright.chromium.connect_over_cdp("http://localhost:9222")`)
+- Turnstile sees a real browser with real history, cookies, fingerprint — looks 100% human
+- Launch Chrome once with: `chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\ChromeBot`
+- Bot detects slot → connects to real Chrome → fills form → user clicks submit (or bot does)
+- This is the cleanest solution, no third-party services needed
+
+**Option 2 — Humanized Playwright session (free, less reliable)**
+- `playwright-stealth` + realistic mouse movements + random typing delays + keeping page open long enough
+- Turnstile scores sessions — might pass if humanization is convincing enough
+- Hit or miss, Turnstile updates frequently
+
+**Option 3 — CapSolver (paid, ~$1-3/1000)**
+- Claims to handle Turnstile but inconsistent
+- Still needs a non-headless browser session to work properly
+
+Recommendation: implement Option 1 for auto-book. Detection/checking stays headless as-is.
+
 ## Notifications
 - [ ] Send a Telegram alert if the bot crashes or goes silent unexpectedly
