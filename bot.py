@@ -1,13 +1,25 @@
 """
-AS-VISA Hungary Schengen Appointment Bot
-Monitors Istanbul and Ankara booking pages and notifies when slots open.
+AS-VISA Hungary Schengen Appointment Bot — Human Browser Mode
+
+Connects to your real Chrome browser via CDP (Chrome DevTools Protocol).
+Opens each URL in a real tab and periodically checks the DOM for changes.
+Looks exactly like a human browsing — real cookies, history, fingerprint.
+
+Setup:
+  1. Close all Chrome windows
+  2. Launch Chrome with:
+     chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\ChromeBot
+  3. Run this bot: python bot.py
+
+The bot will open tabs in your Chrome and refresh them to check for changes.
+Between refreshes it simulates human-like behavior (random scroll, mouse moves).
 
 Telegram commands:
-  /screenshot          — take fresh screenshots of both pages and send them
+  /screenshot          — take screenshots of all watched tabs
   /status              — show check count, last check time, next check ETA
-  /fast                — switch to 1-3 min interval
-  /normal              — switch back to default 3-10 min interval
-  /interval <min> <max> — set custom interval in minutes, e.g. /interval 5 15
+  /fast                — switch to 2-4 min interval
+  /normal              — switch back to default interval
+  /interval <min> <max> — set custom interval in minutes, e.g. /interval 3 8
 """
 
 import asyncio
@@ -19,7 +31,7 @@ import winsound
 from datetime import datetime, date
 from pathlib import Path
 
-import requests
+import requests as req_lib
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from plyer import notification
@@ -28,7 +40,7 @@ load_dotenv()
 
 HEARTBEAT_INTERVAL = 6 * 60 * 60  # 6 hours
 SNAPSHOTS_DIR = Path("snapshots")
-SANITY_PHRASE = "Randevu"
+CDP_URL = "http://localhost:9222"
 
 
 def load_config():
@@ -36,11 +48,15 @@ def load_config():
         return json.load(f)
 
 
+# ---------------------------------------------------------------------------
+# Telegram helpers
+# ---------------------------------------------------------------------------
+
 def send_telegram(message):
     token = os.environ["TELEGRAM_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     try:
-        requests.post(
+        req_lib.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             timeout=10,
@@ -54,7 +70,7 @@ def send_telegram_photo(path, caption=""):
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     try:
         with open(path, "rb") as f:
-            requests.post(
+            req_lib.post(
                 f"https://api.telegram.org/bot{token}/sendPhoto",
                 data={"chat_id": chat_id, "caption": caption},
                 files={"photo": f},
@@ -67,7 +83,7 @@ def send_telegram_photo(path, caption=""):
 def get_telegram_updates(offset):
     token = os.environ["TELEGRAM_TOKEN"]
     try:
-        r = requests.get(
+        r = req_lib.get(
             f"https://api.telegram.org/bot{token}/getUpdates",
             params={"offset": offset, "timeout": 5},
             timeout=10,
@@ -77,8 +93,11 @@ def get_telegram_updates(offset):
         return []
 
 
+# ---------------------------------------------------------------------------
+# Alert
+# ---------------------------------------------------------------------------
+
 def notify(city, url):
-    """Fire the immediate alert — text message, beeps, desktop notification."""
     send_telegram(f"RANDEVU ACILDI — {city}\n{url}")
 
     try:
@@ -102,18 +121,9 @@ def notify(city, url):
     print(f"{'='*60}\n")
 
 
-async def take_and_send_screenshot(page, city, html):
-    """Take a full-page screenshot and send it — runs in background after alert fires."""
-    try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = f"found_{city}_{ts}"
-        await page.screenshot(path=f"{base}.png", full_page=True)
-        Path(f"{base}.html").write_text(html, encoding="utf-8")
-        print(f"  Screenshot: {base}.png  HTML: {base}.html")
-        send_telegram_photo(f"{base}.png", caption=f"{city} - {ts}")
-    except Exception as e:
-        print(f"[!] Screenshot/send failed: {e}")
-
+# ---------------------------------------------------------------------------
+# Snapshots
+# ---------------------------------------------------------------------------
 
 def save_daily_snapshot(city, html):
     SNAPSHOTS_DIR.mkdir(exist_ok=True)
@@ -123,85 +133,114 @@ def save_daily_snapshot(city, html):
         print(f"  Snapshot saved: {path}")
 
 
-async def get_structure_fingerprint(page):
-    """Extract form element structure — tags, names, types, ids."""
-    return await page.evaluate("""() => {
-        const els = document.querySelectorAll('input, select, textarea, button, form');
-        return Array.from(els).map(el => ({
-            tag: el.tagName,
-            type: el.type || null,
-            name: el.name || null,
-            id: el.id || null,
-        }));
-    }""")
-
-
-def load_fingerprint(city):
-    path = SNAPSHOTS_DIR / f"{city}_fingerprint.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return None
-
-
-def save_fingerprint(city, fingerprint):
-    SNAPSHOTS_DIR.mkdir(exist_ok=True)
-    path = SNAPSHOTS_DIR / f"{city}_fingerprint.json"
-    path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
-
-
-async def check_structure_change(page, city):
-    """Compare current page structure with stored fingerprint. Alert if changed."""
-    current = await get_structure_fingerprint(page)
-    stored = load_fingerprint(city)
-
-    if stored is None:
-        save_fingerprint(city, current)
-        print(f"  Fingerprint saved for {city}")
-        return
-
-    if current != stored:
-        save_fingerprint(city, current)
-        print(f"  [!] Structure change detected for {city}!")
-        send_telegram(
-            f"Page structure changed for {city} — form elements added/removed.\n"
-            f"Check snapshots/{city}_fingerprint.json for details."
-        )
-
-
-async def check_url(page, entry, no_appt_phrase):
-    await page.goto(entry["url"], timeout=30_000)
+async def take_and_send_screenshot(page, city):
     try:
-        await page.wait_for_selector(".preloader, #preloader, .loading-overlay", state="hidden", timeout=10_000)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"found_{city}_{ts}.png"
+        await page.screenshot(path=path, full_page=True)
+        print(f"  Screenshot: {path}")
+        send_telegram_photo(path, caption=f"{city} - {ts}")
+    except Exception as e:
+        print(f"[!] Screenshot failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Human-like behavior — make the browser activity look natural
+# ---------------------------------------------------------------------------
+
+async def human_idle(page):
+    """Simulate idle human behavior on the page — small scrolls, mouse moves."""
+    try:
+        viewport = await page.evaluate("({ w: window.innerWidth, h: window.innerHeight })")
+        w, h = viewport["w"], viewport["h"]
+
+        # Random mouse move
+        x = random.randint(100, max(101, w - 100))
+        y = random.randint(100, max(101, h - 100))
+        await page.mouse.move(x, y)
+        await asyncio.sleep(random.uniform(0.3, 1.0))
+
+        # Small scroll
+        scroll_amount = random.randint(-150, 150)
+        await page.mouse.wheel(0, scroll_amount)
+        await asyncio.sleep(random.uniform(0.2, 0.6))
+
+        # Maybe another mouse move
+        if random.random() < 0.5:
+            x2 = random.randint(100, max(101, w - 100))
+            y2 = random.randint(100, max(101, h - 100))
+            await page.mouse.move(x2, y2)
     except Exception:
         pass
-    # Wait for the auto-closing 'Onemli Bilgilendirme' popup to finish its countdown
-    await asyncio.sleep(5)
 
+
+async def human_refresh(page):
+    """Refresh the page like a human would — F5 or click refresh, not page.reload()."""
+    method = random.choice(["f5", "ctrl_r", "reload"])
+    try:
+        if method == "f5":
+            await page.keyboard.press("F5")
+        elif method == "ctrl_r":
+            await page.keyboard.down("Control")
+            await page.keyboard.press("r")
+            await page.keyboard.up("Control")
+        else:
+            await page.reload()
+
+        # Wait for page to load
+        await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        try:
+            await page.wait_for_selector(
+                ".preloader, #preloader, .loading-overlay",
+                state="hidden", timeout=10_000,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        # Fallback to regular reload
+        try:
+            await page.reload(timeout=30_000)
+            await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        except Exception:
+            raise RuntimeError(f"Page refresh failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
+
+async def check_page(page, entry, no_appt_phrase):
+    """Check if the page shows available appointments."""
     text = await page.evaluate("document.body.innerText")
     html = await page.content()
 
-    if SANITY_PHRASE not in text:
-        raise RuntimeError(f"Sanity check failed: '{SANITY_PHRASE}' not found — page may not have loaded correctly")
+    sanity_phrase = "Randevu"
+    if sanity_phrase not in text:
+        raise RuntimeError(f"Sanity check failed: '{sanity_phrase}' not in page text")
 
     save_daily_snapshot(entry["name"], html)
-    await check_structure_change(page, entry["name"])
-    return no_appt_phrase not in text, html
+    available = no_appt_phrase not in text
+    return available, html
 
 
-async def telegram_command_listener(state, page_lock, config, page):
+# ---------------------------------------------------------------------------
+# Telegram command listener
+# ---------------------------------------------------------------------------
+
+async def telegram_command_listener(state, pages, config):
     """Polls Telegram for commands and responds."""
-    urls = config["urls"]
     default_min = config["check_interval_min_seconds"]
     default_max = config["check_interval_max_seconds"]
     offset = 0
 
     while True:
-        updates = await asyncio.get_event_loop().run_in_executor(None, get_telegram_updates, offset)
+        updates = await asyncio.get_event_loop().run_in_executor(
+            None, get_telegram_updates, offset
+        )
 
         for update in updates:
             offset = update["update_id"] + 1
             msg = update.get("message", {})
-            # Only respond to your own chat
             if str(msg.get("chat", {}).get("id", "")) != os.environ["TELEGRAM_CHAT_ID"]:
                 continue
             raw = msg.get("text", "").strip()
@@ -209,22 +248,15 @@ async def telegram_command_listener(state, page_lock, config, page):
 
             if cmd == "/screenshot":
                 print("[CMD] /screenshot")
-                send_telegram("Taking screenshots, one moment...")
-                async with page_lock:
-                    for entry in urls:
-                        try:
-                            await page.goto(entry["url"], timeout=30_000)
-                            try:
-                                await page.wait_for_selector(".preloader, #preloader, .loading-overlay", state="hidden", timeout=10_000)
-                            except Exception:
-                                pass
-                            await asyncio.sleep(5)
-                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            path = f"cmd_screenshot_{entry['name']}_{ts}.png"
-                            await page.screenshot(path=path, full_page=True)
-                            send_telegram_photo(path, caption=entry["name"])
-                        except Exception as e:
-                            send_telegram(f"Screenshot failed for {entry['name']}: {e}")
+                send_telegram("Taking screenshots...")
+                for name, page in pages.items():
+                    try:
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        path = f"cmd_screenshot_{name}_{ts}.png"
+                        await page.screenshot(path=path, full_page=True)
+                        send_telegram_photo(path, caption=name)
+                    except Exception as e:
+                        send_telegram(f"Screenshot failed for {name}: {e}")
 
             elif cmd == "/status":
                 print("[CMD] /status")
@@ -233,73 +265,107 @@ async def telegram_command_listener(state, page_lock, config, page):
                 next_in = state["next_check_in"]
                 next_str = f"{next_in:.1f} min" if next_in is not None else "soon"
                 send_telegram(
-                    f"Argos status\n"
+                    f"Argos status (human browser mode)\n"
                     f"Checks done: {state['check_count']}\n"
                     f"Last check: {last}\n"
                     f"Next check in: {next_str}\n"
-                    f"Interval: {imin//60}-{imax//60} min"
+                    f"Interval: {imin/60:.1f}-{imax/60:.1f} min\n"
+                    f"Tabs open: {len(pages)}"
                 )
 
             elif cmd == "/fast":
                 print("[CMD] /fast")
-                state["interval_min"] = 60
-                state["interval_max"] = 180
-                send_telegram("Switched to fast mode: checking every 1-3 min.")
+                state["interval_min"] = 120
+                state["interval_max"] = 240
+                send_telegram("Switched to fast mode: refreshing every 2-4 min.")
 
             elif cmd == "/normal":
                 print("[CMD] /normal")
                 state["interval_min"] = default_min
                 state["interval_max"] = default_max
-                send_telegram(f"Switched to normal mode: checking every {default_min//60}-{default_max//60} min.")
+                send_telegram(
+                    f"Switched to normal mode: refreshing every "
+                    f"{default_min/60:.1f}-{default_max/60:.1f} min."
+                )
 
             elif cmd.startswith("/interval"):
                 print(f"[CMD] /interval: {raw}")
                 try:
                     parts = raw.split()
-                    imin = int(parts[1]) * 60
-                    imax = int(parts[2]) * 60
-                    if imin < 30:
-                        send_telegram("Minimum interval is 0.5 min (30s). Use /interval 1 5 for 1-5 min.")
+                    imin = float(parts[1]) * 60
+                    imax = float(parts[2]) * 60
+                    if imin < 60:
+                        send_telegram("Minimum interval is 1 min for human mode.")
                     elif imin >= imax:
-                        send_telegram("First value must be less than second. Example: /interval 2 8")
+                        send_telegram("First value must be less than second.")
                     else:
                         state["interval_min"] = imin
                         state["interval_max"] = imax
-                        send_telegram(f"Interval set to {imin//60}-{imax//60} min.")
+                        send_telegram(f"Interval set to {imin/60:.1f}-{imax/60:.1f} min.")
                 except (IndexError, ValueError):
-                    send_telegram("Usage: /interval <min> <max> (in minutes)\nExample: /interval 5 15")
+                    send_telegram(
+                        "Usage: /interval <min> <max> (in minutes)\n"
+                        "Example: /interval 3 8"
+                    )
 
         await asyncio.sleep(3)
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 async def run():
     config = load_config()
     urls = config["urls"]
     no_appt_phrase = config["no_appointment_phrase"]
 
-    print("Visa Appointment Bot started")
-    print("Commands: /screenshot, /status, /fast, /normal, /interval <min> <max>")
-    print(f"Checking every {config['check_interval_min_seconds']//60}-{config['check_interval_max_seconds']//60} min for: {', '.join(e['name'] for e in urls)}\n")
-
-    send_telegram(
-        f"Argos started. Checking {', '.join(e['name'] for e in urls)} every "
-        f"{config['check_interval_min_seconds']//60}-{config['check_interval_max_seconds']//60} min.\n"
-        f"Commands: /screenshot, /status, /fast, /normal, /interval <min> <max>"
-    )
+    print("Visa Appointment Bot — Human Browser Mode")
+    print(f"Connecting to Chrome at {CDP_URL}...")
+    print("Make sure Chrome is running with: chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\ChromeBot\n")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=config["headless"])
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        )
-        page = await context.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        # Connect to the user's real Chrome
+        try:
+            browser = await p.chromium.connect_over_cdp(CDP_URL)
+        except Exception as e:
+            print(f"Failed to connect to Chrome at {CDP_URL}")
+            print(f"Error: {e}")
+            print("\nLaunch Chrome first with:")
+            print('  chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\ChromeBot')
+            return
+
+        print(f"Connected to Chrome ({len(browser.contexts)} existing context(s))")
+
+        # Use existing context or create one
+        if browser.contexts:
+            context = browser.contexts[0]
+        else:
+            context = await browser.new_context()
+
+        # Open a tab for each URL
+        pages = {}  # name -> page
+        for entry in urls:
+            page = await context.new_page()
+            print(f"Opening {entry['name']}: {entry['url']}")
+            await page.goto(entry["url"], timeout=30_000)
+            try:
+                await page.wait_for_selector(
+                    ".preloader, #preloader, .loading-overlay",
+                    state="hidden", timeout=10_000,
+                )
+            except Exception:
+                pass
+            # Wait for any popup to close
+            await asyncio.sleep(6)
+            pages[entry["name"]] = page
+            # Small delay between tab opens — human pace
+            await asyncio.sleep(random.uniform(1, 3))
+
+        print(f"\n{len(pages)} tabs open. Starting monitoring.\n")
+
+        # Build entry lookup
+        entry_by_name = {e["name"]: e for e in urls}
 
         state = {
             "check_count": 0,
@@ -308,9 +374,16 @@ async def run():
             "interval_min": config["check_interval_min_seconds"],
             "interval_max": config["check_interval_max_seconds"],
         }
-        page_lock = asyncio.Lock()
 
-        asyncio.create_task(telegram_command_listener(state, page_lock, config, page))
+        send_telegram(
+            f"Argos started (human browser mode).\n"
+            f"Watching {', '.join(pages.keys())} in real Chrome tabs.\n"
+            f"Refreshing every {state['interval_min']/60:.1f}-"
+            f"{state['interval_max']/60:.1f} min.\n"
+            f"Commands: /screenshot, /status, /fast, /normal, /interval"
+        )
+
+        asyncio.create_task(telegram_command_listener(state, pages, config))
 
         last_heartbeat = time.time()
 
@@ -318,26 +391,55 @@ async def run():
             state["check_count"] += 1
             now = datetime.now().strftime("%H:%M:%S")
 
-            async with page_lock:
-                for entry in urls:
+            # Check each tab
+            for name, page in pages.items():
+                entry = entry_by_name[name]
+                try:
+                    # Bring tab to front briefly (like a human switching tabs)
+                    await page.bring_to_front()
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+
+                    # Do some human-like idle activity before refreshing
+                    await human_idle(page)
+                    await asyncio.sleep(random.uniform(0.5, 2.0))
+
+                    # Refresh the page like a human
+                    await human_refresh(page)
+
+                    # Wait for popup to auto-close
+                    await asyncio.sleep(random.uniform(5, 7))
+
+                    # Check for availability
+                    available, html = await check_page(page, entry, no_appt_phrase)
+                    status = "AVAILABLE !!!" if available else "unavailable"
+                    print(f"[{now}] #{state['check_count']} {name}: {status}")
+
+                    if available:
+                        notify(name, entry["url"])
+                        await take_and_send_screenshot(page, name)
+
+                except Exception as e:
+                    print(f"[{now}] #{state['check_count']} {name}: ERROR - {e}")
+                    send_telegram(f"Argos error on {name}: {e}")
+
+                    # Try to recover the tab
                     try:
-                        available, html = await check_url(page, entry, no_appt_phrase)
-                        status = "AVAILABLE !!!" if available else "unavailable"
-                        print(f"[{now}] #{state['check_count']} {entry['name']}: {status}")
+                        await page.goto(entry["url"], timeout=30_000)
+                        await asyncio.sleep(6)
+                    except Exception:
+                        pass
 
-                        if available:
-                            notify(entry["name"], entry["url"])
-                            if config.get("screenshot_on_found"):
-                                asyncio.create_task(take_and_send_screenshot(page, entry["name"], html))
-
-                    except Exception as e:
-                        print(f"[{now}] #{state['check_count']} {entry['name']}: ERROR - {e}")
-                        send_telegram(f"Argos error on {entry['name']}: {e}")
+                # Random delay between tabs — like a human switching
+                if len(pages) > 1:
+                    await asyncio.sleep(random.uniform(2, 5))
 
             state["last_check_time"] = now
 
             if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
-                send_telegram(f"Argos still running. {state['check_count']} checks done, no slots yet.")
+                send_telegram(
+                    f"Argos still running (human browser). "
+                    f"{state['check_count']} checks done, no slots yet."
+                )
                 last_heartbeat = time.time()
 
             wait = random.uniform(state["interval_min"], state["interval_max"])
