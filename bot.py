@@ -6,6 +6,7 @@ Hybrid approach:
   - requests uses those cookies for fast HTTP GET checks (~200ms each).
   - On 403 or sanity failure, Playwright re-bootstraps the session.
   - Session is proactively refreshed every SESSION_REFRESH_INTERVAL seconds.
+  - On IP ban (connection refused), sends Telegram alert and pauses until /resume.
 
 Telegram commands:
   /screenshot          — take fresh screenshots of both pages and send them
@@ -13,6 +14,7 @@ Telegram commands:
   /fast                — switch to 30-60s interval
   /normal              — switch back to default interval
   /interval <min> <max> — set custom interval in minutes, e.g. /interval 1 5
+  /resume              — resume after IP ban (restart modem first)
 """
 
 import asyncio
@@ -41,6 +43,10 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+class IPBannedError(Exception):
+    pass
 
 
 def load_config():
@@ -186,9 +192,16 @@ async def bootstrap_session(page, urls):
 def fast_check(http_session, entry, no_appt_phrase):
     """
     Fast HTTP GET check using the shared requests session.
-    Returns (available: bool, html: str) or raises on failure.
+    Returns (available: bool, html: str, elapsed: float) or raises on failure.
+    Raises IPBannedError on connection refused (Cloudflare IP ban).
     """
-    r = http_session.get(entry["url"], timeout=15)
+    t0 = time.time()
+    try:
+        r = http_session.get(entry["url"], timeout=15)
+    except req_lib.exceptions.ConnectionError as e:
+        raise IPBannedError(f"Connection refused — IP likely banned") from e
+
+    elapsed = time.time() - t0
 
     if r.status_code == 403:
         raise RuntimeError("403 — session expired, need Playwright refresh")
@@ -202,7 +215,7 @@ def fast_check(http_session, entry, no_appt_phrase):
         raise RuntimeError(f"Sanity check failed: '{SANITY_PHRASE}' not found")
 
     available = no_appt_phrase not in html
-    return available, html
+    return available, html, elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +272,9 @@ async def telegram_command_listener(state, page_lock, page, config):
                 fast_count = state["fast_check_count"]
                 pw_count = state["playwright_check_count"]
                 last_refresh = state["last_session_refresh"] or "not yet"
+                banned = " ⚠️ IP BANNED — send /resume after modem restart" if state["ip_banned"] else ""
                 send_telegram(
-                    f"Argos status (fast HTTP mode)\n"
+                    f"Argos status (fast HTTP mode){banned}\n"
                     f"Fast checks: {fast_count}  Playwright checks: {pw_count}\n"
                     f"Last check: {last}\n"
                     f"Next check in: {next_str}\n"
@@ -282,6 +296,14 @@ async def telegram_command_listener(state, page_lock, page, config):
                     f"Switched to normal mode: checking every "
                     f"{default_min//60}-{default_max//60} min."
                 )
+
+            elif cmd == "/resume":
+                print("[CMD] /resume")
+                if state["ip_banned"]:
+                    state["ip_banned"] = False
+                    send_telegram("Resuming checks. Good luck!")
+                else:
+                    send_telegram("Not paused.")
 
             elif cmd.startswith("/interval"):
                 print(f"[CMD] /interval: {raw}")
@@ -339,6 +361,7 @@ async def run():
             "interval_min": config["check_interval_min_seconds"],
             "interval_max": config["check_interval_max_seconds"],
             "last_session_refresh": datetime.now().strftime("%H:%M:%S"),
+            "ip_banned": False,
         }
 
         send_telegram(
@@ -355,6 +378,12 @@ async def run():
         while True:
             now = datetime.now().strftime("%H:%M:%S")
 
+            # Pause loop while IP banned — wait for /resume
+            if state["ip_banned"]:
+                print(f"[{now}] IP banned — paused. Send /resume after modem restart.")
+                await asyncio.sleep(30)
+                continue
+
             # Proactive session refresh every SESSION_REFRESH_INTERVAL
             if time.time() - last_session_refresh >= SESSION_REFRESH_INTERVAL:
                 print(f"[{now}] Session refresh (proactive)...")
@@ -363,13 +392,16 @@ async def run():
                 last_session_refresh = time.time()
                 state["last_session_refresh"] = now
 
+            loop = asyncio.get_event_loop()
             for entry in urls:
                 try:
-                    # Try fast HTTP check first
-                    available, html = fast_check(http_session, entry, no_appt_phrase)
+                    # Fast HTTP check — run in executor to avoid blocking event loop
+                    available, html, elapsed = await loop.run_in_executor(
+                        None, fast_check, http_session, entry, no_appt_phrase
+                    )
                     state["fast_check_count"] += 1
                     status = "AVAILABLE !!!" if available else "unavailable"
-                    print(f"[{now}] HTTP #{state['fast_check_count']} {entry['name']}: {status}")
+                    print(f"[{now}] HTTP #{state['fast_check_count']} {entry['name']}: {status} ({elapsed*1000:.0f}ms)")
 
                     save_daily_snapshot(entry["name"], html)
 
@@ -378,6 +410,16 @@ async def run():
                         if config.get("screenshot_on_found"):
                             async with page_lock:
                                 await take_and_send_screenshot(page, entry["name"], html)
+
+                except IPBannedError as e:
+                    print(f"[{now}] {e}")
+                    if not state["ip_banned"]:
+                        state["ip_banned"] = True
+                        send_telegram(
+                            "IP banned by Cloudflare — checks paused.\n"
+                            "Restart your modem, then send /resume."
+                        )
+                    break  # no point checking other cities
 
                 except Exception as e:
                     print(f"[{now}] HTTP check failed ({entry['name']}): {e} — falling back to Playwright")
@@ -422,6 +464,14 @@ async def run():
                             print("  [Session] Cookies refreshed after fallback")
 
                     except Exception as e2:
+                        if "ERR_CONNECTION_REFUSED" in str(e2) or "Connection refused" in str(e2):
+                            if not state["ip_banned"]:
+                                state["ip_banned"] = True
+                                send_telegram(
+                                    "IP banned by Cloudflare — checks paused.\n"
+                                    "Restart your modem, then send /resume."
+                                )
+                            break
                         print(f"[{now}] Playwright fallback also failed ({entry['name']}): {e2}")
                         send_telegram(f"Argos error on {entry['name']}: {e2}")
 
