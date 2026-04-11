@@ -15,6 +15,7 @@ Telegram commands:
   /normal              — switch back to default interval
   /interval <min> <max> — set custom interval in minutes, e.g. /interval 1 5
   /resume              — resume after IP ban (restart modem first)
+  /compare             — fetch each page via HTTP and Playwright, compare results
 """
 
 import asyncio
@@ -305,6 +306,74 @@ async def telegram_command_listener(state, page_lock, page, config):
                 else:
                     send_telegram("Not paused.")
 
+            elif cmd == "/compare":
+                print("[CMD] /compare")
+                send_telegram("Comparing HTTP vs Playwright for each city...")
+                no_appt = config["no_appointment_phrase"]
+                http_sess = state.get("http_session")
+                if not http_sess:
+                    send_telegram("No HTTP session available yet.")
+                else:
+                    lines = []
+                    for entry in urls:
+                        # HTTP fetch
+                        try:
+                            t0 = time.time()
+                            r = http_sess.get(entry["url"], timeout=15)
+                            http_elapsed = time.time() - t0
+                            http_html = r.text
+                            http_code = r.status_code
+                            http_has_sanity = SANITY_PHRASE in http_html
+                            http_has_no_appt = no_appt in http_html
+                            http_size = len(http_html)
+                            if not http_has_sanity:
+                                http_verdict = "INVALID (sanity missing)"
+                            elif not http_has_no_appt:
+                                http_verdict = "SLOTS OPEN"
+                            else:
+                                http_verdict = "no slots"
+                        except Exception as e:
+                            http_verdict = f"ERROR: {e}"
+                            http_elapsed = 0
+                            http_size = 0
+                            http_code = 0
+
+                        # Playwright fetch
+                        try:
+                            async with page_lock:
+                                await page.goto(entry["url"], timeout=30_000)
+                                try:
+                                    await page.wait_for_selector(
+                                        ".preloader, #preloader, .loading-overlay",
+                                        state="hidden", timeout=10_000,
+                                    )
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(5)
+                                pw_html = await page.content()
+                            pw_has_sanity = SANITY_PHRASE in pw_html
+                            pw_has_no_appt = no_appt in pw_html
+                            pw_size = len(pw_html)
+                            if not pw_has_sanity:
+                                pw_verdict = "INVALID (sanity missing)"
+                            elif not pw_has_no_appt:
+                                pw_verdict = "SLOTS OPEN"
+                            else:
+                                pw_verdict = "no slots"
+                        except Exception as e:
+                            pw_verdict = f"ERROR: {e}"
+                            pw_size = 0
+
+                        match = "MATCH" if http_verdict == pw_verdict else "*** MISMATCH ***"
+                        lines.append(
+                            f"{entry['name']}:\n"
+                            f"  HTTP  ({http_elapsed*1000:.0f}ms, {http_size} bytes, {http_code}): {http_verdict}\n"
+                            f"  PW    ({pw_size} bytes): {pw_verdict}\n"
+                            f"  → {match}"
+                        )
+
+                    send_telegram("Compare results:\n\n" + "\n\n".join(lines))
+
             elif cmd.startswith("/interval"):
                 print(f"[CMD] /interval: {raw}")
                 try:
@@ -362,6 +431,7 @@ async def run():
             "interval_max": config["check_interval_max_seconds"],
             "last_session_refresh": datetime.now().strftime("%H:%M:%S"),
             "ip_banned": False,
+            "http_session": http_session,
         }
 
         send_telegram(
@@ -389,6 +459,7 @@ async def run():
                 print(f"[{now}] Session refresh (proactive)...")
                 async with page_lock:
                     http_session = await bootstrap_session(page, urls)
+                state["http_session"] = http_session
                 last_session_refresh = time.time()
                 state["last_session_refresh"] = now
 
