@@ -14,7 +14,7 @@ Telegram commands:
   /fast                — switch to 30-60s interval
   /normal              — switch back to default interval
   /interval <min> <max> — set custom interval in minutes, e.g. /interval 1 5
-  /resume              — resume after IP ban (restart modem first)
+  /resume              — resume after IP ban (restart modem first, or auto-resumes after 15 min)
   /compare             — fetch each page via HTTP and Playwright, compare results
 """
 
@@ -36,6 +36,7 @@ load_dotenv()
 
 HEARTBEAT_INTERVAL = 6 * 60 * 60      # 6 hours
 SESSION_REFRESH_INTERVAL = 15 * 60    # re-bootstrap Playwright session every 15 min
+IP_BAN_AUTO_RESUME_AFTER = 15 * 60   # auto-resume after 15 min if still banned
 SNAPSHOTS_DIR = Path("snapshots")
 SANITY_PHRASE = "Randevu"
 
@@ -104,13 +105,13 @@ def get_telegram_updates(offset):
 # Alert
 # ---------------------------------------------------------------------------
 
-def notify(city, url):
-    send_telegram(f"RANDEVU ACILDI — {city}\n{url}")
+def notify(city, url, method="HTTP"):
+    send_telegram(f"RANDEVU ACILDI — {city}\nYontem: {method}\n{url}")
 
     try:
         notification.notify(
             title=f"Vize Randevusu Acildi! - {city}",
-            message=f"{city} icin randevu acildi. Hemen rezervasyon yap!",
+            message=f"{city} icin randevu acildi ({method}). Hemen rezervasyon yap!",
             app_name="Visa Bot",
             timeout=30,
         )
@@ -122,7 +123,7 @@ def notify(city, url):
         time.sleep(0.3)
 
     print(f"\n{'='*60}")
-    print(f"  RANDEVU ACILDI! - {city}")
+    print(f"  RANDEVU ACILDI! - {city}  [{method}]")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  {url}")
     print(f"{'='*60}\n")
@@ -273,7 +274,13 @@ async def telegram_command_listener(state, page_lock, page, config):
                 fast_count = state["fast_check_count"]
                 pw_count = state["playwright_check_count"]
                 last_refresh = state["last_session_refresh"] or "not yet"
-                banned = " ⚠️ IP BANNED — send /resume after modem restart" if state["ip_banned"] else ""
+                if state["ip_banned"] and state["ip_banned_at"]:
+                    remaining = IP_BAN_AUTO_RESUME_AFTER - (time.time() - state["ip_banned_at"])
+                    banned = f" ⚠️ IP BANNED — auto-resume in {max(0, remaining/60):.1f} min (or /resume now)"
+                elif state["ip_banned"]:
+                    banned = " ⚠️ IP BANNED — send /resume after modem restart"
+                else:
+                    banned = ""
                 send_telegram(
                     f"Argos status (fast HTTP mode){banned}\n"
                     f"Fast checks: {fast_count}  Playwright checks: {pw_count}\n"
@@ -431,6 +438,7 @@ async def run():
             "interval_max": config["check_interval_max_seconds"],
             "last_session_refresh": datetime.now().strftime("%H:%M:%S"),
             "ip_banned": False,
+            "ip_banned_at": None,
             "http_session": http_session,
         }
 
@@ -448,10 +456,21 @@ async def run():
         while True:
             now = datetime.now().strftime("%H:%M:%S")
 
-            # Pause loop while IP banned — wait for /resume
+            # Pause loop while IP banned — wait for /resume or auto-resume after timeout
             if state["ip_banned"]:
-                print(f"[{now}] IP banned — paused. Send /resume after modem restart.")
-                await asyncio.sleep(30)
+                banned_for = time.time() - (state["ip_banned_at"] or time.time())
+                remaining = IP_BAN_AUTO_RESUME_AFTER - banned_for
+                if remaining <= 0:
+                    state["ip_banned"] = False
+                    state["ip_banned_at"] = None
+                    send_telegram(
+                        f"Auto-resuming after {IP_BAN_AUTO_RESUME_AFTER//60} min ban pause. "
+                        f"Fingers crossed the ban lifted..."
+                    )
+                    print(f"[{now}] Auto-resuming after IP ban timeout.")
+                else:
+                    print(f"[{now}] IP banned — paused. Auto-resume in {remaining/60:.1f} min. Send /resume to force.")
+                    await asyncio.sleep(30)
                 continue
 
             # Proactive session refresh every SESSION_REFRESH_INTERVAL
@@ -477,7 +496,7 @@ async def run():
                     save_daily_snapshot(entry["name"], html)
 
                     if available:
-                        notify(entry["name"], entry["url"])
+                        notify(entry["name"], entry["url"], method="HTTP")
                         if config.get("screenshot_on_found"):
                             async with page_lock:
                                 await take_and_send_screenshot(page, entry["name"], html)
@@ -486,9 +505,11 @@ async def run():
                     print(f"[{now}] {e}")
                     if not state["ip_banned"]:
                         state["ip_banned"] = True
+                        state["ip_banned_at"] = time.time()
                         send_telegram(
-                            "IP banned by Cloudflare — checks paused.\n"
-                            "Restart your modem, then send /resume."
+                            f"IP banned by Cloudflare — checks paused.\n"
+                            f"Restart your modem, then send /resume.\n"
+                            f"Will auto-resume in {IP_BAN_AUTO_RESUME_AFTER//60} min if not resumed manually."
                         )
                     break  # no point checking other cities
 
@@ -522,7 +543,7 @@ async def run():
                             save_daily_snapshot(entry["name"], html)
 
                             if available:
-                                notify(entry["name"], entry["url"])
+                                notify(entry["name"], entry["url"], method="Playwright")
                                 if config.get("screenshot_on_found"):
                                     await take_and_send_screenshot(page, entry["name"], html)
 
@@ -538,9 +559,11 @@ async def run():
                         if "ERR_CONNECTION_REFUSED" in str(e2) or "Connection refused" in str(e2):
                             if not state["ip_banned"]:
                                 state["ip_banned"] = True
+                                state["ip_banned_at"] = time.time()
                                 send_telegram(
-                                    "IP banned by Cloudflare — checks paused.\n"
-                                    "Restart your modem, then send /resume."
+                                    f"IP banned by Cloudflare — checks paused.\n"
+                                    f"Restart your modem, then send /resume.\n"
+                                    f"Will auto-resume in {IP_BAN_AUTO_RESUME_AFTER//60} min if not resumed manually."
                                 )
                             break
                         print(f"[{now}] Playwright fallback also failed ({entry['name']}): {e2}")
