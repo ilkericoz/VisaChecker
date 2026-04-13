@@ -16,6 +16,8 @@ Telegram commands:
   /interval <min> <max> — set custom interval in minutes, e.g. /interval 1 5
   /resume              — resume after IP ban (restart modem first, or auto-resumes after 15 min)
   /compare             — fetch each page via HTTP and Playwright, compare results
+  /probe               — blindly POST to TarihGetir with tabId 1-15 to discover valid IDs
+  /extract             — load each page in Playwright and scrape form field values (only useful when slots are open)
 """
 
 import asyncio
@@ -189,6 +191,72 @@ async def bootstrap_session(page, urls):
 
     print(f"  [Session] Got {len(http_session.cookies)} cookies from Playwright")
     return http_session
+
+
+async def extract_form_fields(page, entry):
+    """
+    Load the appointment page in Playwright and scrape select options + CSRF token.
+    Only useful when slots are actually open (form is rendered).
+    Sends findings to Telegram.
+    """
+    try:
+        await page.goto(entry["url"], timeout=30_000)
+        try:
+            await page.wait_for_selector(
+                ".preloader, #preloader, .loading-overlay",
+                state="hidden", timeout=10_000,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+        csrf = None
+        try:
+            csrf = await page.eval_on_selector(
+                'input[name="__RequestVerificationToken"]', "el => el.value"
+            )
+        except Exception:
+            pass
+
+        appt_options = []
+        try:
+            appt_options = await page.evaluate(
+                "() => Array.from(document.querySelectorAll('#AppointmentTabID option'))"
+                ".map(o => ({value: o.value, text: o.textContent.trim()}))"
+            )
+        except Exception:
+            pass
+
+        nat_options = []
+        try:
+            nat_options = await page.evaluate(
+                "() => Array.from(document.querySelectorAll('#NationalityTabID option'))"
+                ".map(o => ({value: o.value, text: o.textContent.trim()}))"
+            )
+        except Exception:
+            pass
+
+        lines = [f"Form fields — {entry['name']}:"]
+        lines.append(f"CSRF token: {'found (' + csrf[:20] + '...)' if csrf else 'NOT FOUND (form not rendered?)'}")
+        if appt_options:
+            lines.append("AppointmentTabID options:")
+            for o in appt_options:
+                lines.append(f"  value={o['value']!r}  text={o['text']!r}")
+        else:
+            lines.append("AppointmentTabID: not found")
+        if nat_options:
+            lines.append("NationalityTabID options (first 8):")
+            for o in nat_options[:8]:
+                lines.append(f"  value={o['value']!r}  text={o['text']!r}")
+        else:
+            lines.append("NationalityTabID: not found")
+
+        send_telegram("\n".join(lines))
+        return {"csrf": csrf, "appt_options": appt_options, "nat_options": nat_options}
+
+    except Exception as e:
+        send_telegram(f"extract_form_fields failed ({entry['name']}): {e}")
+        return {}
 
 
 def fast_check(http_session, entry, no_appt_phrase):
@@ -381,6 +449,74 @@ async def telegram_command_listener(state, page_lock, page, config):
 
                     send_telegram("Compare results:\n\n" + "\n\n".join(lines))
 
+            elif cmd == "/extract":
+                print("[CMD] /extract")
+                send_telegram("Loading each city page to scrape form fields (only useful when slots are open)...")
+                for entry in urls:
+                    async with page_lock:
+                        await extract_form_fields(page, entry)
+
+            elif cmd == "/probe":
+                print("[CMD] /probe")
+                send_telegram("Probing TarihGetir with tabId 1-15 for each city...")
+                http_sess = state.get("http_session")
+                if not http_sess:
+                    send_telegram("No HTTP session yet.")
+                else:
+                    base = "https://appointment.as-visa.com"
+                    for entry in urls:
+                        api_path = entry.get("tarih_getir_path")
+                        if not api_path:
+                            send_telegram(f"{entry['name']}: no tarih_getir_path in config")
+                            continue
+
+                        # Try to grab CSRF from page via Playwright
+                        csrf = None
+                        try:
+                            async with page_lock:
+                                await page.goto(entry["url"], timeout=30_000)
+                                await asyncio.sleep(3)
+                                try:
+                                    csrf = await page.eval_on_selector(
+                                        'input[name="__RequestVerificationToken"]',
+                                        "el => el.value",
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        api_url = base + api_path
+                        lines = [f"Probe {entry['name']} → {api_path}"]
+                        lines.append(f"CSRF: {'found' if csrf else 'not found — trying without'}")
+
+                        country_candidates = ["TÜRKİYE", "TURKEY", "TR", "1"]
+                        for countryid in country_candidates:
+                            for tab_id in range(1, 16):
+                                try:
+                                    headers = {}
+                                    if csrf:
+                                        headers["RequestVerificationToken"] = csrf
+                                    r = await asyncio.get_event_loop().run_in_executor(
+                                        None,
+                                        lambda: http_sess.post(
+                                            api_url,
+                                            data={"tabId": tab_id, "countryid": countryid},
+                                            headers=headers,
+                                            timeout=10,
+                                        ),
+                                    )
+                                    body = r.text.strip()[:120]
+                                    if r.status_code == 200 and body not in ("", "null", "[]", "false"):
+                                        lines.append(f"  *** HIT: countryid={countryid!r} tabId={tab_id} → {r.status_code} {body}")
+                                    else:
+                                        lines.append(f"  countryid={countryid!r} tabId={tab_id} → {r.status_code} {body or '(empty)'}")
+                                except Exception as e:
+                                    lines.append(f"  countryid={countryid!r} tabId={tab_id} → ERROR: {e}")
+
+                        # Send per-city to avoid Telegram message length limits
+                        send_telegram("\n".join(lines))
+
             elif cmd.startswith("/interval"):
                 print(f"[CMD] /interval: {raw}")
                 try:
@@ -497,8 +633,9 @@ async def run():
 
                     if available:
                         notify(entry["name"], entry["url"], method="HTTP")
-                        if config.get("screenshot_on_found"):
-                            async with page_lock:
+                        async with page_lock:
+                            await extract_form_fields(page, entry)
+                            if config.get("screenshot_on_found"):
                                 await take_and_send_screenshot(page, entry["name"], html)
 
                 except IPBannedError as e:
@@ -544,6 +681,7 @@ async def run():
 
                             if available:
                                 notify(entry["name"], entry["url"], method="Playwright")
+                                await extract_form_fields(page, entry)
                                 if config.get("screenshot_on_found"):
                                     await take_and_send_screenshot(page, entry["name"], html)
 

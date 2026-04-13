@@ -2,11 +2,13 @@
   "urls": [
     {
       "name": "Istanbul",
-      "url": "https://appointment.as-visa.com/tr/istanbul-bireysel-basvuru"
+      "url": "https://appointment.as-visa.com/tr/istanbul-bireysel-basvuru",
+      "tarih_getir_path": "/Macaristan/TarihGetir"
     },
     {
       "name": "Ankara",
-      "url": "https://appointment.as-visa.com/tr/ankara-bireysel-basvuru"
+      "url": "https://appointment.as-visa.com/tr/ankara-bireysel-basvuru",
+      "tarih_getir_path": "/AnBir/Macaristan/TarihGetir"
     }
   ],
   "check_interval_min_seconds": 60,
