@@ -5,3 +5,18 @@ __pycache__/
 *.html
 .env
 snapshots/
+
+# FareHarbor bot lives on the `fareharbor` branch — not part of fast-http
+fareharbor_bot.py
+fareharbor_config.json
+fareharbor_subscribers.json
+launch_fareharbor_chrome.bat
+fareharbor source files/
+probe_recent_panel.py
+
+# Reference-only site captures (too large / not needed in git)
+Ankara source files/
+Istanbul source files/
+
+# Stray symlink
+C--Users-bjk20-Desktop-Visa

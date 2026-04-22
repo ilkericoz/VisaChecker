@@ -4,7 +4,13 @@ AS-VISA Hungary Schengen Appointment Bot — Fast HTTP Mode
 Hybrid approach:
   - Playwright boots up, loads the page to get past Cloudflare, then extracts cookies.
   - requests uses those cookies for fast HTTP GET checks (~200ms each).
-  - On 403 or sanity failure, Playwright re-bootstraps the session.
+  - Detection is structural: the booking form (AppointmentTabID +
+    __RequestVerificationToken) only renders when slots are open; the
+    "no slots" block replaces it otherwise.
+  - On detection, CSRF + option values are parsed straight from the HTML
+    and TarihGetir is called directly to fetch actual available dates —
+    no browser needed on the hot path.
+  - On 403 or unknown layout, Playwright re-bootstraps the session.
   - Session is proactively refreshed every SESSION_REFRESH_INTERVAL seconds.
   - On IP ban (connection refused), sends Telegram alert and pauses until /resume.
 
@@ -21,9 +27,11 @@ Telegram commands:
 """
 
 import asyncio
+import html as html_lib
 import json
 import os
 import random
+import re
 import time
 import winsound
 from datetime import datetime, date
@@ -41,6 +49,9 @@ SESSION_REFRESH_INTERVAL = 15 * 60    # re-bootstrap Playwright session every 15
 IP_BAN_AUTO_RESUME_AFTER = 15 * 60   # auto-resume after 15 min if still banned
 SNAPSHOTS_DIR = Path("snapshots")
 SANITY_PHRASE = "Randevu"
+FORM_MARKER = 'id="AppointmentTabID"'
+CSRF_MARKER = '__RequestVerificationToken'
+TARIH_GETIR_BASE = "https://appointment.as-visa.com"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -259,9 +270,135 @@ async def extract_form_fields(page, entry):
         return {}
 
 
+def parse_form_from_html(html):
+    """
+    Regex-extract CSRF token + AppointmentTabID options + default NationalityTabID
+    from the HTML we already fetched. No browser needed.
+    Returns dict or {} if the form isn't in the HTML.
+    """
+    if FORM_MARKER not in html or CSRF_MARKER not in html:
+        return {}
+
+    csrf = None
+    m = re.search(
+        r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', html
+    )
+    if not m:
+        m = re.search(
+            r'value="([^"]+)"[^>]*name="__RequestVerificationToken"', html
+        )
+    if m:
+        csrf = m.group(1)
+
+    appt_options = []
+    appt_block = re.search(
+        r'<select[^>]*id="AppointmentTabID"[^>]*>(.*?)</select>', html, re.DOTALL
+    )
+    if appt_block:
+        for om in re.finditer(
+            r'<option[^>]*value="([^"]*)"[^>]*>(.*?)</option>',
+            appt_block.group(1), re.DOTALL,
+        ):
+            val = om.group(1).strip()
+            text = html_lib.unescape(re.sub(r'\s+', ' ', om.group(2))).strip()
+            if val:
+                appt_options.append({"value": val, "text": text})
+
+    nat_default = None
+    nat_block = re.search(
+        r'<select[^>]*id="NationalityTabID"[^>]*>(.*?)</select>', html, re.DOTALL
+    )
+    if nat_block:
+        # Prefer the option with `selected`, else first non-empty value
+        sel = re.search(
+            r'<option[^>]*value="([^"]+)"[^>]*selected', nat_block.group(1)
+        )
+        if sel:
+            nat_default = sel.group(1)
+        else:
+            first = re.search(
+                r'<option[^>]*value="([^"]+)"', nat_block.group(1)
+            )
+            if first:
+                nat_default = first.group(1)
+
+    return {"csrf": csrf, "appt_options": appt_options, "nat_default": nat_default}
+
+
+def fetch_available_dates(http_session, entry, csrf, tab_id, country_id):
+    """
+    POST to TarihGetir with the CSRF token + selected tab/country IDs.
+    Returns list of date strings (e.g. ["2026-4-15", ...]) or [].
+    """
+    api_path = entry.get("tarih_getir_path")
+    if not api_path:
+        return []
+    url = TARIH_GETIR_BASE + api_path
+    headers = {
+        "RequestVerificationToken": csrf or "",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": entry["url"],
+    }
+    try:
+        r = http_session.post(
+            url,
+            data={"tabId": tab_id, "countryid": country_id},
+            headers=headers,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"  [TarihGetir] {entry['name']} failed: {e}")
+        return []
+
+
+async def report_dates_from_html(http_session, entry, html, loop):
+    """
+    Parse CSRF + option values from the HTML, hit TarihGetir for each
+    AppointmentTabID option, Telegram the date lists. All HTTP — no browser.
+    """
+    parsed = parse_form_from_html(html)
+    if not parsed or not parsed.get("csrf"):
+        send_telegram(
+            f"{entry['name']}: slots detected but couldn't parse form from HTML "
+            f"(CSRF/options missing). Try /extract or open the page manually."
+        )
+        return
+
+    csrf = parsed["csrf"]
+    nat = parsed.get("nat_default") or "TÜRKİYE"
+    opts = parsed.get("appt_options") or []
+    if not opts:
+        send_telegram(
+            f"{entry['name']}: SLOTS OPEN but AppointmentTabID options not found in HTML."
+        )
+        return
+
+    lines = [f"{entry['name']} — available dates:"]
+    for opt in opts:
+        dates = await loop.run_in_executor(
+            None,
+            fetch_available_dates,
+            http_session, entry, csrf, opt["value"], nat,
+        )
+        label = opt["text"] or opt["value"]
+        if dates:
+            lines.append(f"• {label}: {', '.join(dates)}")
+        else:
+            lines.append(f"• {label}: (none / API returned empty)")
+    send_telegram("\n".join(lines))
+
+
 def fast_check(http_session, entry, no_appt_phrase):
     """
     Fast HTTP GET check using the shared requests session.
+    Detection is structural: the booking form (AppointmentTabID +
+    __RequestVerificationToken) only renders when slots are open. The
+    "no slots" block and the form are mutually exclusive in the server
+    response.
     Returns (available: bool, html: str, elapsed: float) or raises on failure.
     Raises IPBannedError on connection refused (Cloudflare IP ban).
     """
@@ -284,7 +421,21 @@ def fast_check(http_session, entry, no_appt_phrase):
     if SANITY_PHRASE not in html:
         raise RuntimeError(f"Sanity check failed: '{SANITY_PHRASE}' not found")
 
-    available = no_appt_phrase not in html
+    has_form = FORM_MARKER in html and CSRF_MARKER in html
+    has_no_slots = no_appt_phrase in html
+
+    if has_form:
+        available = True
+    elif has_no_slots:
+        available = False
+    else:
+        # Neither marker — page layout may have shifted. Treat as sanity fail
+        # so we fall back to Playwright and surface the issue instead of
+        # silently misreporting.
+        raise RuntimeError(
+            "Layout unknown: neither form nor no-slots block present"
+        )
+
     return available, html, elapsed
 
 
@@ -633,8 +784,10 @@ async def run():
 
                     if available:
                         notify(entry["name"], entry["url"], method="HTTP")
+                        await report_dates_from_html(
+                            http_session, entry, html, loop
+                        )
                         async with page_lock:
-                            await extract_form_fields(page, entry)
                             if config.get("screenshot_on_found"):
                                 await take_and_send_screenshot(page, entry["name"], html)
 
@@ -672,7 +825,12 @@ async def run():
                             if SANITY_PHRASE not in text:
                                 raise RuntimeError("Sanity check failed after Playwright fallback")
 
-                            available = no_appt_phrase not in text
+                            # Prefer structural check on full HTML; fall back to phrase on text
+                            has_form = FORM_MARKER in html and CSRF_MARKER in html
+                            if has_form:
+                                available = True
+                            else:
+                                available = no_appt_phrase not in text
                             state["playwright_check_count"] += 1
                             status = "AVAILABLE !!!" if available else "unavailable"
                             print(f"[{now}] PW  #{state['playwright_check_count']} {entry['name']}: {status}")
@@ -681,7 +839,9 @@ async def run():
 
                             if available:
                                 notify(entry["name"], entry["url"], method="Playwright")
-                                await extract_form_fields(page, entry)
+                                await report_dates_from_html(
+                                    http_session, entry, html, loop
+                                )
                                 if config.get("screenshot_on_found"):
                                     await take_and_send_screenshot(page, entry["name"], html)
 
