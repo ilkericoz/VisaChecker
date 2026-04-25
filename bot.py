@@ -74,7 +74,7 @@ STATIC_TEXT_FIELDS = {
     'input[name="Phone"]':         "phone",
     'input[name="reEmail"]':       "email_confirm",
     'input#passportEndDate':       "passport_expiry",
-    'input#TravelDate':            "travel_date",
+    'input#TravelDate':            "travel_date",  # injected as dd/mm/yyyy via JS
 }
 # Static <select> fields: selector → profile key
 STATIC_SELECT_FIELDS = {
@@ -422,11 +422,16 @@ async def fast_track_book(entry, http_session, profile, tarih_results, base, con
                 failed.append(f"email: {e}")
 
             # Static text fields (handle readonly date inputs via JS)
+            DATE_KEYS = {"passport_expiry", "travel_date"}
             for sel, key in STATIC_TEXT_FIELDS.items():
                 value = profile.get(key, "")
                 if not value:
                     continue
                 try:
+                    # Date picker fields need dd/mm/yyyy not YYYY-MM-DD
+                    if key in DATE_KEYS:
+                        y, m, d = str(value).split("-")
+                        value = f"{int(d):02d}/{int(m):02d}/{y}"
                     is_readonly = await page.eval_on_selector(sel, "el => el.readOnly")
                     if is_readonly:
                         await page.evaluate(
