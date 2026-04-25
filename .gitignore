@@ -5,6 +5,7 @@ __pycache__/
 *.html
 .env
 snapshots/
+booking_profile.json
 
 # FareHarbor bot lives on the `fareharbor` branch — not part of fast-http
 fareharbor_bot.py

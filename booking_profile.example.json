@@ -1,0 +1,21 @@
+{
+  "first_name": "",
+  "last_name": "",
+  "passport_no": "",
+  "passport_expiry": "YYYY-MM-DD",
+  "tc_kimlik": "",
+  "tc_kimlik_confirm": "",
+  "birth_year": "",
+  "phone": "",
+  "email": "",
+  "email_confirm": "",
+  "nationality": "TÜRKİYE",
+  "appointment_type": "Macaristan Bireysel Randevu (C)",
+  "travel_purpose": "Turist",
+  "travel_date": "",
+  "date_preference": {
+    "rule": "first_available",
+    "earliest_date": null,
+    "latest_date": null
+  }
+}

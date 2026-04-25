@@ -24,6 +24,11 @@ Telegram commands:
   /compare             — fetch each page via HTTP and Playwright, compare results
   /probe               — blindly POST to TarihGetir with tabId 1-15 to discover valid IDs
   /extract             — load each page in Playwright and scrape form field values (only useful when slots are open)
+  /book                — manually run the fast-track booker against the most recent detected slot
+
+Config flags:
+  auto_book            — auto-launch fast-track booker on slot detection (default false; flip when ready)
+  headed_on_book       — show the booking browser window (default true; required for fast-track captcha)
 """
 
 import asyncio
@@ -52,6 +57,31 @@ SANITY_PHRASE = "Randevu"
 FORM_MARKER = 'id="AppointmentTabID"'
 CSRF_MARKER = '__RequestVerificationToken'
 TARIH_GETIR_BASE = "https://appointment.as-visa.com"
+BOOKING_PROFILE_PATH = "booking_profile.json"
+
+# Form fields whose `name` rotates every page render (anti-scraper).
+# Map by the placeholder text (which IS stable) → profile key.
+ROTATING_FIELD_PLACEHOLDERS = {
+    "Adınızı Giriniz":         "first_name",
+    "Soyadınızı Giriniz":      "last_name",
+    "Pasaport No Giriniz":     "passport_no",
+    "T.C. Kimlik No Giriniz":  "tc_kimlik",
+}
+# Static (non-rotating) text inputs: selector → profile key
+STATIC_TEXT_FIELDS = {
+    'input[name="reTCKN"]':        "tc_kimlik_confirm",
+    'input[name="DogumYili"]':     "birth_year",
+    'input[name="Phone"]':         "phone",
+    'input[name="reEmail"]':       "email_confirm",
+    'input#passportEndDate':       "passport_expiry",
+    'input#TravelDate':            "travel_date",
+}
+# Static <select> fields: selector → profile key
+STATIC_SELECT_FIELDS = {
+    'select#NationalityTabID': "nationality",
+    'select#AppointmentTabID': "appointment_type",
+    'select#TravelSubject':    "travel_purpose",
+}
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -259,6 +289,208 @@ def dump_forensic_bundle(base, *, http_session=None, html=None, dom_html=None,
         print(f"  Forensic bundle ({base}): {', '.join(written)}")
     except Exception as e:
         print(f"[!] Forensic dump failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Fast-track booker — headed browser, auto-fill personal info, stop at captcha
+# ---------------------------------------------------------------------------
+
+def load_booking_profile():
+    try:
+        with open(BOOKING_PROFILE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"[!] Booking profile load failed: {e}")
+        return None
+
+
+def pick_date(tarih_results, preference):
+    """
+    Pick an AppointmentDate from TarihGetir results based on profile preference.
+    TarihGetir returns dates like '2026-4-15'; normalize to YYYY-MM-DD before comparing.
+    Returns (option_label, normalized_date) or (None, None).
+    """
+    if not tarih_results or not tarih_results.get("results"):
+        return None, None
+    rule = (preference or {}).get("rule", "first_available")
+    earliest = (preference or {}).get("earliest_date")
+    latest = (preference or {}).get("latest_date")
+    for opt in tarih_results["results"]:
+        for d in opt.get("dates", []):
+            try:
+                p = d.split("-")
+                norm = f"{int(p[0]):04d}-{int(p[1]):02d}-{int(p[2]):02d}"
+            except Exception:
+                continue
+            if rule == "window":
+                if earliest and norm < earliest:
+                    continue
+                if latest and norm > latest:
+                    continue
+            return opt.get("label"), norm
+    return None, None
+
+
+async def fast_track_book(entry, http_session, profile, tarih_results, base, config):
+    """
+    Open a HEADED Playwright window, fill all personal-info fields from
+    the profile, and stop. User completes captcha + date/time + submit.
+    Honeypot fields (hp_*) are never touched — only mapped fields are filled.
+    """
+    label, picked_date = pick_date(tarih_results, profile.get("date_preference"))
+    if picked_date:
+        send_telegram(
+            f"Fast-track: opening {entry['name']} booking window.\n"
+            f"Suggested date: {picked_date} ({label}).\n"
+            f"Pre-filling personal info — type captcha + click Randevu Al when ready."
+        )
+    else:
+        send_telegram(
+            f"Fast-track: no date matched profile preference; opening window "
+            f"with personal info pre-filled. Pick a date manually."
+        )
+
+    try:
+        winsound.Beep(880, 600)
+    except Exception:
+        pass
+
+    headless = not config.get("headed_on_book", True)
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=headless)
+            context = await browser.new_context(user_agent=USER_AGENT)
+            cookie_list = []
+            for c in http_session.cookies:
+                cookie_list.append({
+                    "name": c.name, "value": c.value,
+                    "domain": c.domain or "appointment.as-visa.com",
+                    "path": c.path or "/",
+                })
+            try:
+                if cookie_list:
+                    await context.add_cookies(cookie_list)
+            except Exception as e:
+                print(f"[Booker] cookie inject failed: {e}")
+
+            page = await context.new_page()
+            await page.goto(entry["url"], timeout=30_000)
+            try:
+                await page.wait_for_selector("#apForm", timeout=15_000)
+            except Exception:
+                send_telegram(
+                    "Fast-track: form didn't render within 15s — slot may have closed. "
+                    "Window left open so you can investigate."
+                )
+                return
+
+            filled, failed = [], []
+
+            # Rotating fields by placeholder text
+            for placeholder, key in ROTATING_FIELD_PLACEHOLDERS.items():
+                value = profile.get(key, "")
+                if not value:
+                    continue
+                sel = f'input[placeholder="{placeholder}"]'
+                try:
+                    await page.fill(sel, str(value))
+                    filled.append(key)
+                except Exception as e:
+                    failed.append(f"{key}: {e}")
+
+            # Email pair: two inputs share placeholder "E-posta Giriniz".
+            # Primary = rotating ase_<hex>; confirm = static reEmail.
+            try:
+                em = profile.get("email", "")
+                if em:
+                    await page.evaluate(
+                        "(v) => {"
+                        "  const inputs = document.querySelectorAll('input[placeholder=\"E-posta Giriniz\"]');"
+                        "  for (const i of inputs) {"
+                        "    if (i.name && i.name.startsWith('ase_')) {"
+                        "      i.value = v;"
+                        "      i.dispatchEvent(new Event('input',{bubbles:true}));"
+                        "    }"
+                        "  }"
+                        "}",
+                        em,
+                    )
+                    filled.append("email")
+            except Exception as e:
+                failed.append(f"email: {e}")
+
+            # Static text fields (handle readonly date inputs via JS)
+            for sel, key in STATIC_TEXT_FIELDS.items():
+                value = profile.get(key, "")
+                if not value:
+                    continue
+                try:
+                    is_readonly = await page.eval_on_selector(sel, "el => el.readOnly")
+                    if is_readonly:
+                        await page.evaluate(
+                            "(args) => { const el = document.querySelector(args.sel);"
+                            " if (el) { el.value = args.v; el.dispatchEvent(new Event('change',{bubbles:true})); } }",
+                            {"sel": sel, "v": str(value)},
+                        )
+                    else:
+                        await page.fill(sel, str(value))
+                    filled.append(key)
+                except Exception as e:
+                    failed.append(f"{key}: {e}")
+
+            # Static selects
+            for sel, key in STATIC_SELECT_FIELDS.items():
+                value = profile.get(key, "")
+                if not value:
+                    continue
+                try:
+                    await page.select_option(sel, value)
+                    filled.append(key)
+                except Exception as e:
+                    failed.append(f"{key}: {e}")
+
+            # Best-effort: prefill the AppointmentDate picker text. Calendar
+            # widget may overwrite — user can adjust.
+            if picked_date:
+                try:
+                    await page.evaluate(
+                        "(v) => { const el = document.getElementById('datepicker');"
+                        " if (el) { el.value = v; el.dispatchEvent(new Event('change',{bubbles:true})); } }",
+                        picked_date,
+                    )
+                except Exception:
+                    pass
+
+            # Persist booker outcome to forensics
+            try:
+                Path(f"{base}.booker.json").write_text(
+                    json.dumps({
+                        "filled": filled, "failed": failed,
+                        "picked_date": picked_date, "label": label,
+                    }, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+            send_telegram(
+                f"Fast-track: filled {len(filled)} fields"
+                + (f", {len(failed)} failed" if failed else "")
+                + ".\nWindow is open — type the captcha, pick date/time, click Randevu Al."
+                + (f"\nFailed: {'; '.join(failed[:5])}" if failed else "")
+            )
+
+            # Hold the booker open until the user closes the page manually.
+            try:
+                await page.wait_for_event("close", timeout=0)
+            except Exception:
+                pass
+
+    except Exception as e:
+        send_telegram(f"Fast-track booker crashed: {e}")
+        print(f"[Booker] crashed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -708,6 +940,35 @@ async def telegram_command_listener(state, page_lock, page, config):
                     async with page_lock:
                         await extract_form_fields(page, entry)
 
+            elif cmd == "/book":
+                print("[CMD] /book")
+                last = state.get("last_found")
+                if not last:
+                    send_telegram(
+                        "No detected slot to book. /book triggers the fast-track "
+                        "booker against the most recent detection — none yet."
+                    )
+                elif state.get("booking_in_progress"):
+                    send_telegram("A booking is already in progress.")
+                else:
+                    profile = load_booking_profile()
+                    if not profile:
+                        send_telegram(
+                            f"{BOOKING_PROFILE_PATH} missing or unreadable. "
+                            f"Copy booking_profile.example.json and fill it."
+                        )
+                    else:
+                        state["booking_in_progress"] = True
+                        async def _manual_book():
+                            try:
+                                await fast_track_book(
+                                    last["entry"], state["http_session"],
+                                    profile, last["tarih_results"], last["base"], config,
+                                )
+                            finally:
+                                state["booking_in_progress"] = False
+                        asyncio.create_task(_manual_book())
+
             elif cmd == "/probe":
                 print("[CMD] /probe")
                 send_telegram("Probing TarihGetir with tabId 1-15 for each city...")
@@ -828,13 +1089,15 @@ async def run():
             "ip_banned": False,
             "ip_banned_at": None,
             "http_session": http_session,
+            "last_found": None,
+            "booking_in_progress": False,
         }
 
         send_telegram(
             f"Argos started (fast HTTP mode).\n"
             f"Watching {', '.join(e['name'] for e in urls)} every "
             f"{state['interval_min']//60}-{state['interval_max']//60} min.\n"
-            f"Commands: /screenshot, /status, /fast, /normal, /interval"
+            f"Commands: /screenshot, /status, /fast, /normal, /interval, /book"
         )
 
         asyncio.create_task(telegram_command_listener(state, page_lock, page, config))
@@ -904,6 +1167,25 @@ async def run():
                                 await take_and_send_screenshot(
                                     page, base, caption=f"{entry['name']} - {ts}"
                                 )
+                        # Stash for /book manual trigger
+                        state["last_found"] = {
+                            "entry": entry, "tarih_results": tarih_results,
+                            "base": base,
+                        }
+                        if config.get("auto_book") and not state.get("booking_in_progress"):
+                            profile = load_booking_profile()
+                            if not profile:
+                                send_telegram(
+                                    f"Auto-book is on but {BOOKING_PROFILE_PATH} is missing — skipping booker."
+                                )
+                            else:
+                                state["booking_in_progress"] = True
+                                async def _book_then_clear(entry, http_session, profile, tarih_results, base, config):
+                                    try:
+                                        await fast_track_book(entry, http_session, profile, tarih_results, base, config)
+                                    finally:
+                                        state["booking_in_progress"] = False
+                                asyncio.create_task(_book_then_clear(entry, http_session, profile, tarih_results, base, config))
 
                 except IPBannedError as e:
                     print(f"[{now}] {e}")
@@ -975,6 +1257,24 @@ async def run():
                                     await take_and_send_screenshot(
                                         page, base, caption=f"{entry['name']} - {ts}"
                                     )
+                                state["last_found"] = {
+                                    "entry": entry, "tarih_results": tarih_results,
+                                    "base": base,
+                                }
+                                if config.get("auto_book") and not state.get("booking_in_progress"):
+                                    profile = load_booking_profile()
+                                    if not profile:
+                                        send_telegram(
+                                            f"Auto-book is on but {BOOKING_PROFILE_PATH} is missing — skipping booker."
+                                        )
+                                    else:
+                                        state["booking_in_progress"] = True
+                                        async def _book_then_clear(entry, http_session, profile, tarih_results, base, config):
+                                            try:
+                                                await fast_track_book(entry, http_session, profile, tarih_results, base, config)
+                                            finally:
+                                                state["booking_in_progress"] = False
+                                        asyncio.create_task(_book_then_clear(entry, http_session, profile, tarih_results, base, config))
 
                             # Refresh cookies from this successful Playwright load
                             cookies = await page.context.cookies()
