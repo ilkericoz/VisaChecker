@@ -815,7 +815,7 @@ def fast_check(http_session, entry, no_appt_phrase):
     try:
         r = http_session.get(entry["url"], timeout=15)
     except req_lib.exceptions.ConnectionError as e:
-        raise IPBannedError(f"Connection refused — IP likely banned") from e
+        raise RuntimeError(f"Connection error — {e}") from e
 
     elapsed = time.time() - t0
 
@@ -1361,16 +1361,6 @@ async def run():
                             print("  [Session] Cookies refreshed after fallback")
 
                     except Exception as e2:
-                        if "ERR_CONNECTION_REFUSED" in str(e2) or "Connection refused" in str(e2):
-                            if not state["ip_banned"]:
-                                state["ip_banned"] = True
-                                state["ip_banned_at"] = time.time()
-                                send_telegram(
-                                    f"IP banned by Cloudflare — checks paused.\n"
-                                    f"Restart your modem, then send /resume.\n"
-                                    f"Will auto-resume in {IP_BAN_AUTO_RESUME_AFTER//60} min if not resumed manually."
-                                )
-                            break
                         print(f"[{now}] Playwright fallback also failed ({entry['name']}): {e2}")
                         send_telegram(f"Argos error on {entry['name']}: {e2}")
 
