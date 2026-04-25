@@ -154,16 +154,111 @@ def save_daily_snapshot(city, html):
         print(f"  Snapshot saved: {path}")
 
 
-async def take_and_send_screenshot(page, city, html):
+async def take_and_send_screenshot(page, base, caption):
     try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = f"found_{city}_{ts}"
         await page.screenshot(path=f"{base}.png", full_page=True)
-        Path(f"{base}.html").write_text(html, encoding="utf-8")
-        print(f"  Screenshot: {base}.png  HTML: {base}.html")
-        send_telegram_photo(f"{base}.png", caption=f"{city} - {ts}")
+        print(f"  Screenshot: {base}.png")
+        send_telegram_photo(f"{base}.png", caption=caption)
     except Exception as e:
         print(f"[!] Screenshot/send failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Forensic dump — when slots are detected, save everything we have for replay
+# ---------------------------------------------------------------------------
+
+CAPTCHA_DATA_URI_RE = re.compile(
+    r'<img[^>]*src="data:image/(png|jpeg|jpg|gif);base64,([^"]+)"',
+    re.IGNORECASE,
+)
+RECAPTCHA_KEY_RE = re.compile(r"recaptchaSiteKey\s*=\s*['\"]([^'\"]+)['\"]")
+
+
+def extract_inline_captcha(html):
+    """Return (ext, bytes) for the embedded KCAPTCHA image, or (None, None).
+    The server HTML-entity-encodes '+' as '&#x2B;' (and similar for '/', '='),
+    so we unescape before base64-decoding.
+    """
+    import base64
+    for m in CAPTCHA_DATA_URI_RE.finditer(html):
+        # Skip favicons/logos by requiring an alt hint near the tag — the
+        # security-code img has alt="Güvenlik Kodu". If no alt match found,
+        # fall through to the first hit (better than nothing for forensics).
+        tag_end = html.find('>', m.start())
+        tag = html[m.start():tag_end + 1] if tag_end != -1 else ''
+        is_captcha = 'üvenlik' in tag or 'uvenlik' in tag or 'aptcha' in tag.lower()
+        if not is_captcha and CAPTCHA_DATA_URI_RE.search(html, tag_end):
+            continue  # there are more imgs to try
+        b64 = html_lib.unescape(m.group(2))
+        try:
+            return m.group(1), base64.b64decode(b64)
+        except Exception:
+            continue
+    return None, None
+
+
+def dump_forensic_bundle(base, *, http_session=None, html=None, dom_html=None,
+                         tarih_results=None, status_code=None, elapsed=None,
+                         detector=None):
+    """
+    On slot detection, write everything useful for post-mortem and auto-book replay:
+      {base}.html         raw HTTP response body that triggered detection
+      {base}.dom.html     Playwright-rendered DOM (only on PW path)
+      {base}.cookies.json session cookies that successfully fetched the form
+      {base}.captcha.{ext} embedded KCAPTCHA image bytes
+      {base}.tarih.json   per-AppointmentTabID date results from TarihGetir
+      {base}.meta.json    status, elapsed ms, detector path, recaptcha key, etc.
+    """
+    written = []
+    try:
+        if html is not None:
+            Path(f"{base}.html").write_text(html, encoding="utf-8")
+            written.append("html")
+
+        if dom_html is not None and dom_html != html:
+            Path(f"{base}.dom.html").write_text(dom_html, encoding="utf-8")
+            written.append("dom.html")
+
+        if http_session is not None:
+            cookies = {c.name: c.value for c in http_session.cookies}
+            Path(f"{base}.cookies.json").write_text(
+                json.dumps(cookies, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            written.append("cookies.json")
+
+        if html is not None:
+            ext, blob = extract_inline_captcha(html)
+            if blob:
+                Path(f"{base}.captcha.{ext}").write_bytes(blob)
+                written.append(f"captcha.{ext}")
+
+        if tarih_results is not None:
+            Path(f"{base}.tarih.json").write_text(
+                json.dumps(tarih_results, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            written.append("tarih.json")
+
+        meta = {
+            "timestamp": datetime.now().isoformat(),
+            "detector": detector,
+            "status_code": status_code,
+            "elapsed_ms": int(elapsed * 1000) if elapsed is not None else None,
+            "has_form_marker": bool(html and FORM_MARKER in html),
+            "has_csrf_marker": bool(html and CSRF_MARKER in html),
+            "recaptcha_site_key": None,
+        }
+        if html:
+            rk = RECAPTCHA_KEY_RE.search(html)
+            if rk:
+                meta["recaptcha_site_key"] = rk.group(1)
+        Path(f"{base}.meta.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        written.append("meta.json")
+
+        print(f"  Forensic bundle ({base}): {', '.join(written)}")
+    except Exception as e:
+        print(f"[!] Forensic dump failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +454,8 @@ async def report_dates_from_html(http_session, entry, html, loop):
     """
     Parse CSRF + option values from the HTML, hit TarihGetir for each
     AppointmentTabID option, Telegram the date lists. All HTTP — no browser.
+    Returns a dict with the per-option results (saved as forensic .tarih.json),
+    or None if the form couldn't be parsed.
     """
     parsed = parse_form_from_html(html)
     if not parsed or not parsed.get("csrf"):
@@ -366,7 +463,7 @@ async def report_dates_from_html(http_session, entry, html, loop):
             f"{entry['name']}: slots detected but couldn't parse form from HTML "
             f"(CSRF/options missing). Try /extract or open the page manually."
         )
-        return
+        return None
 
     csrf = parsed["csrf"]
     nat = parsed.get("nat_default") or "TÜRKİYE"
@@ -375,8 +472,9 @@ async def report_dates_from_html(http_session, entry, html, loop):
         send_telegram(
             f"{entry['name']}: SLOTS OPEN but AppointmentTabID options not found in HTML."
         )
-        return
+        return {"csrf": csrf, "nat": nat, "options": [], "results": []}
 
+    results = []
     lines = [f"{entry['name']} — available dates:"]
     for opt in opts:
         dates = await loop.run_in_executor(
@@ -385,11 +483,13 @@ async def report_dates_from_html(http_session, entry, html, loop):
             http_session, entry, csrf, opt["value"], nat,
         )
         label = opt["text"] or opt["value"]
+        results.append({"value": opt["value"], "label": label, "dates": dates})
         if dates:
             lines.append(f"• {label}: {', '.join(dates)}")
         else:
             lines.append(f"• {label}: (none / API returned empty)")
     send_telegram("\n".join(lines))
+    return {"csrf": csrf, "nat": nat, "options": opts, "results": results}
 
 
 def fast_check(http_session, entry, no_appt_phrase):
@@ -399,7 +499,8 @@ def fast_check(http_session, entry, no_appt_phrase):
     __RequestVerificationToken) only renders when slots are open. The
     "no slots" block and the form are mutually exclusive in the server
     response.
-    Returns (available: bool, html: str, elapsed: float) or raises on failure.
+    Returns (available: bool, html: str, elapsed: float, status_code: int)
+    or raises on failure.
     Raises IPBannedError on connection refused (Cloudflare IP ban).
     """
     t0 = time.time()
@@ -436,7 +537,7 @@ def fast_check(http_session, entry, no_appt_phrase):
             "Layout unknown: neither form nor no-slots block present"
         )
 
-    return available, html, elapsed
+    return available, html, elapsed, r.status_code
 
 
 # ---------------------------------------------------------------------------
@@ -773,7 +874,7 @@ async def run():
             for entry in urls:
                 try:
                     # Fast HTTP check — run in executor to avoid blocking event loop
-                    available, html, elapsed = await loop.run_in_executor(
+                    available, html, elapsed, status_code = await loop.run_in_executor(
                         None, fast_check, http_session, entry, no_appt_phrase
                     )
                     state["fast_check_count"] += 1
@@ -784,12 +885,25 @@ async def run():
 
                     if available:
                         notify(entry["name"], entry["url"], method="HTTP")
-                        await report_dates_from_html(
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        base = f"found_{entry['name']}_{ts}"
+                        tarih_results = await report_dates_from_html(
                             http_session, entry, html, loop
+                        )
+                        dump_forensic_bundle(
+                            base,
+                            http_session=http_session,
+                            html=html,
+                            tarih_results=tarih_results,
+                            status_code=status_code,
+                            elapsed=elapsed,
+                            detector="HTTP",
                         )
                         async with page_lock:
                             if config.get("screenshot_on_found"):
-                                await take_and_send_screenshot(page, entry["name"], html)
+                                await take_and_send_screenshot(
+                                    page, base, caption=f"{entry['name']} - {ts}"
+                                )
 
                 except IPBannedError as e:
                     print(f"[{now}] {e}")
@@ -839,11 +953,28 @@ async def run():
 
                             if available:
                                 notify(entry["name"], entry["url"], method="Playwright")
-                                await report_dates_from_html(
+                                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                base = f"found_{entry['name']}_{ts}"
+                                tarih_results = await report_dates_from_html(
                                     http_session, entry, html, loop
                                 )
+                                # html here is page.content() (rendered DOM); pass as both
+                                # raw html and dom_html so captcha/markers are extracted
+                                # and the DOM is preserved alongside if it differs.
+                                dump_forensic_bundle(
+                                    base,
+                                    http_session=http_session,
+                                    html=html,
+                                    dom_html=html,
+                                    tarih_results=tarih_results,
+                                    status_code=200,
+                                    elapsed=None,
+                                    detector="Playwright",
+                                )
                                 if config.get("screenshot_on_found"):
-                                    await take_and_send_screenshot(page, entry["name"], html)
+                                    await take_and_send_screenshot(
+                                        page, base, caption=f"{entry['name']} - {ts}"
+                                    )
 
                             # Refresh cookies from this successful Playwright load
                             cookies = await page.context.cookies()
