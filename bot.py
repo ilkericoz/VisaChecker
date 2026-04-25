@@ -451,17 +451,47 @@ async def fast_track_book(entry, http_session, profile, tarih_results, base, con
                 except Exception as e:
                     failed.append(f"{key}: {e}")
 
-            # Best-effort: prefill the AppointmentDate picker text. Calendar
-            # widget may overwrite — user can adjust.
+            # Prefill appointment date + fetch and inject time slots.
+            times = []
             if picked_date:
                 try:
+                    # Format datepicker expects dd/mm/yyyy
+                    y, mo, d = picked_date.split("-")
+                    date_for_picker = f"{int(d):02d}/{int(mo):02d}/{y}"
                     await page.evaluate(
                         "(v) => { const el = document.getElementById('datepicker');"
                         " if (el) { el.value = v; el.dispatchEvent(new Event('change',{bubbles:true})); } }",
-                        picked_date,
+                        date_for_picker,
                     )
                 except Exception:
                     pass
+
+                # Fetch available time slots via SaatGetir and inject into select
+                try:
+                    times = await asyncio.get_event_loop().run_in_executor(
+                        None, fetch_available_times, http_session, entry, picked_date
+                    )
+                    if times:
+                        await page.evaluate(
+                            "(slots) => {"
+                            "  const sel = document.getElementById('AppointmentTime');"
+                            "  if (!sel) return;"
+                            "  sel.innerHTML = '';"
+                            "  for (const s of slots) {"
+                            "    const o = document.createElement('option');"
+                            "    o.value = s.value; o.textContent = s.text;"
+                            "    sel.appendChild(o);"
+                            "  }"
+                            "  if (slots.length > 0) {"
+                            "    sel.value = slots[0].value;"
+                            "    sel.dispatchEvent(new Event('change',{bubbles:true}));"
+                            "  }"
+                            "}",
+                            times,
+                        )
+                        filled.append(f"appointment_time ({times[0].get('text','')})")
+                except Exception as e:
+                    failed.append(f"appointment_time: {e}")
 
             # Persist booker outcome to forensics
             try:
@@ -469,16 +499,26 @@ async def fast_track_book(entry, http_session, profile, tarih_results, base, con
                     json.dumps({
                         "filled": filled, "failed": failed,
                         "picked_date": picked_date, "label": label,
+                        "time_slots": times,
                     }, indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
             except Exception:
                 pass
 
+            time_line = ""
+            if times:
+                time_line = f"\nTime slots loaded ({len(times)}): {', '.join(s.get('text','') for s in times[:4])}"
+                if len(times) > 4:
+                    time_line += f" (+{len(times)-4} more)"
+            elif picked_date:
+                time_line = "\nNo time slots returned from SaatGetir — pick manually."
+
             send_telegram(
                 f"Fast-track: filled {len(filled)} fields"
                 + (f", {len(failed)} failed" if failed else "")
-                + ".\nWindow is open — type the captcha, pick date/time, click Randevu Al."
+                + ".\nWindow is open — type the captcha + click Randevu Al."
+                + time_line
                 + (f"\nFailed: {'; '.join(failed[:5])}" if failed else "")
             )
 
@@ -679,6 +719,37 @@ def fetch_available_dates(http_session, entry, csrf, tab_id, country_id):
         return data if isinstance(data, list) else []
     except Exception as e:
         print(f"  [TarihGetir] {entry['name']} failed: {e}")
+        return []
+
+
+def fetch_available_times(http_session, entry, date_norm):
+    """
+    POST to SaatGetir for a given date.
+    date_norm is YYYY-MM-DD; SaatGetir expects dd/mm/yyyy (datepicker format).
+    Returns list of {value, text} dicts or [].
+    """
+    api_path = entry.get("saat_getir_path")
+    if not api_path:
+        return []
+    try:
+        y, m, d = date_norm.split("-")
+        date_tab = f"{int(d):02d}/{int(m):02d}/{y}"
+    except Exception:
+        return []
+    url = TARIH_GETIR_BASE + api_path
+    try:
+        r = http_session.post(
+            url,
+            data={"dateTab": date_tab},
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": entry["url"]},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"  [SaatGetir] {entry['name']} failed: {e}")
         return []
 
 
