@@ -19,5 +19,16 @@ probe_recent_panel.py
 Ankara source files/
 Istanbul source files/
 
+# Runtime forensic dumps
+found_*.json
+found_*.cookies.json
+found_*.meta.json
+found_*.tarih.json
+found_*.booker.json
+found_*.submit.json
+
+# Claude Code local config
+.claude/
+
 # Stray symlink
 C--Users-bjk20-Desktop-Visa

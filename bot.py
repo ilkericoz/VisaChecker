@@ -333,7 +333,7 @@ def pick_date(tarih_results, preference):
     return None, None
 
 
-async def fast_track_book(entry, http_session, profile, tarih_results, base, config):
+async def fast_track_book(entry, http_session, pw_context, profile, tarih_results, base, config):
     """
     Open a HEADED Playwright window, fill all personal-info fields from
     the profile, and stop. User completes captcha + date/time + submit.
@@ -361,21 +361,39 @@ async def fast_track_book(entry, http_session, profile, tarih_results, base, con
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=headless)
-            context = await browser.new_context(user_agent=USER_AGENT)
-            cookie_list = []
-            for c in http_session.cookies:
-                cookie_list.append({
-                    "name": c.name, "value": c.value,
-                    "domain": c.domain or "appointment.as-visa.com",
-                    "path": c.path or "/",
-                })
+            book_context = await browser.new_context(user_agent=USER_AGENT)
+            # Use cookies from the shared Playwright context — includes cf_clearance
+            # and other browser-set cookies that requests doesn't carry.
             try:
+                cookie_list = await pw_context.cookies()
                 if cookie_list:
-                    await context.add_cookies(cookie_list)
+                    await book_context.add_cookies(cookie_list)
             except Exception as e:
                 print(f"[Booker] cookie inject failed: {e}")
 
-            page = await context.new_page()
+            page = await book_context.new_page()
+
+            # Capture every POST to the appointment domain.
+            # The "Randevu Al" submit fires one — save it for full-auto analysis.
+            submit_captures = []
+            def _on_request(request):
+                if request.method == "POST" and "appointment.as-visa.com" in request.url:
+                    try:
+                        submit_captures.append({
+                            "url": request.url,
+                            "post_data": request.post_data,
+                            "headers": {
+                                k: v for k, v in request.headers.items()
+                                if k.lower() in (
+                                    "content-type", "referer", "x-requested-with",
+                                    "__requestverificationtoken",
+                                )
+                            },
+                        })
+                    except Exception:
+                        pass
+            page.on("request", _on_request)
+
             await page.goto(entry["url"], timeout=30_000)
             try:
                 await page.wait_for_selector("#apForm", timeout=15_000)
@@ -511,6 +529,16 @@ async def fast_track_book(entry, http_session, profile, tarih_results, base, con
             except Exception:
                 pass
 
+            # Screenshot of the pre-filled form — sent to Telegram immediately
+            # so you can verify field state even if you're away from the screen.
+            try:
+                shot_path = f"{base}.prefilled.png"
+                await page.screenshot(path=shot_path, full_page=True)
+                send_telegram_photo(shot_path, caption=f"Pre-filled form — {entry['name']} ({picked_date or 'no date'})")
+                print(f"  Pre-filled screenshot: {shot_path}")
+            except Exception as e:
+                print(f"[Booker] screenshot failed: {e}")
+
             time_line = ""
             if times:
                 time_line = f"\nTime slots loaded ({len(times)}): {', '.join(s.get('text','') for s in times[:4])}"
@@ -532,6 +560,24 @@ async def fast_track_book(entry, http_session, profile, tarih_results, base, con
                 await page.wait_for_event("close", timeout=0)
             except Exception:
                 pass
+
+            # Dump any POSTs captured while the window was open.
+            # The submit request is the key one — endpoint + full payload for future full-auto.
+            if submit_captures:
+                try:
+                    Path(f"{base}.submit.json").write_text(
+                        json.dumps(submit_captures, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    last = submit_captures[-1]
+                    send_telegram(
+                        f"Submit captured ({len(submit_captures)} POST):\n"
+                        f"{last['url']}\n"
+                        f"Payload: {str(last.get('post_data', ''))[:400]}"
+                    )
+                    print(f"  Submit captured: {base}.submit.json ({len(submit_captures)} requests)")
+                except Exception as e:
+                    print(f"[Booker] submit dump failed: {e}")
 
     except Exception as e:
         send_telegram(f"Fast-track booker crashed: {e}")
@@ -1039,6 +1085,7 @@ async def telegram_command_listener(state, page_lock, page, config):
                             try:
                                 await fast_track_book(
                                     last["entry"], state["http_session"],
+                                    state["pw_context"],
                                     profile, last["tarih_results"], last["base"], config,
                                 )
                             finally:
@@ -1165,6 +1212,7 @@ async def run():
             "ip_banned": False,
             "ip_banned_at": None,
             "http_session": http_session,
+            "pw_context": context,
             "last_found": None,
             "booking_in_progress": False,
         }
@@ -1240,6 +1288,18 @@ async def run():
                         )
                         async with page_lock:
                             if config.get("screenshot_on_found"):
+                                try:
+                                    await page.goto(entry["url"], timeout=30_000)
+                                    try:
+                                        await page.wait_for_selector(
+                                            ".preloader, #preloader, .loading-overlay",
+                                            state="hidden", timeout=10_000,
+                                        )
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(3)
+                                except Exception as nav_e:
+                                    print(f"  [Screenshot] Navigation failed: {nav_e}")
                                 await take_and_send_screenshot(
                                     page, base, caption=f"{entry['name']} - {ts}"
                                 )
@@ -1256,12 +1316,12 @@ async def run():
                                 )
                             else:
                                 state["booking_in_progress"] = True
-                                async def _book_then_clear(entry, http_session, profile, tarih_results, base, config):
+                                async def _book_then_clear(entry, http_session, pw_context, profile, tarih_results, base, config):
                                     try:
-                                        await fast_track_book(entry, http_session, profile, tarih_results, base, config)
+                                        await fast_track_book(entry, http_session, pw_context, profile, tarih_results, base, config)
                                     finally:
                                         state["booking_in_progress"] = False
-                                asyncio.create_task(_book_then_clear(entry, http_session, profile, tarih_results, base, config))
+                                asyncio.create_task(_book_then_clear(entry, http_session, context, profile, tarih_results, base, config))
 
                 except IPBannedError as e:
                     print(f"[{now}] {e}")
@@ -1345,12 +1405,12 @@ async def run():
                                         )
                                     else:
                                         state["booking_in_progress"] = True
-                                        async def _book_then_clear(entry, http_session, profile, tarih_results, base, config):
+                                        async def _book_then_clear(entry, http_session, pw_context, profile, tarih_results, base, config):
                                             try:
-                                                await fast_track_book(entry, http_session, profile, tarih_results, base, config)
+                                                await fast_track_book(entry, http_session, pw_context, profile, tarih_results, base, config)
                                             finally:
                                                 state["booking_in_progress"] = False
-                                        asyncio.create_task(_book_then_clear(entry, http_session, profile, tarih_results, base, config))
+                                        asyncio.create_task(_book_then_clear(entry, http_session, context, profile, tarih_results, base, config))
 
                             # Refresh cookies from this successful Playwright load
                             cookies = await page.context.cookies()
