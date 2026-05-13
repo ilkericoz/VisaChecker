@@ -37,6 +37,8 @@ import json
 import os
 import random
 import re
+import socket
+import subprocess
 import time
 import winsound
 from datetime import datetime, date
@@ -58,6 +60,11 @@ FORM_MARKER = 'id="AppointmentTabID"'
 CSRF_MARKER = '__RequestVerificationToken'
 TARIH_GETIR_BASE = "https://appointment.as-visa.com"
 BOOKING_PROFILE_PATH = "booking_profile.json"
+CHROME_CDP_URL = "http://localhost:9222"
+# Dedicated Chrome profile stored in the project dir.
+# First use: launch Chrome manually with this profile and visit the AS-VISA page
+# once so Cloudflare sets cf_clearance. After that the bot reuses it automatically.
+CHROME_PROFILE_DIR = Path("chrome_visa_profile").resolve()
 
 # Form fields whose `name` rotates every page render (anti-scraper).
 # Map by the placeholder text (which IS stable) → profile key.
@@ -72,9 +79,9 @@ STATIC_TEXT_FIELDS = {
     'input[name="reTCKN"]':        "tc_kimlik_confirm",
     'input[name="DogumYili"]':     "birth_year",
     'input[name="Phone"]':         "phone",
-    'input[name="reEmail"]':       "email_confirm",
+    'input[name="rEmail"]':        "email_confirm",  # makeAppointment.js uses rEmail not reEmail
     'input#passportEndDate':       "passport_expiry",
-    'input#TravelDate':            "travel_date",  # injected as dd/mm/yyyy via JS
+    # TravelDate handled separately via jQuery datepicker API (must fire changeDate to unlock #apDate)
 }
 # Static <select> fields: selector → profile key
 STATIC_SELECT_FIELDS = {
@@ -292,6 +299,69 @@ def dump_forensic_bundle(base, *, http_session=None, html=None, dom_html=None,
 
 
 # ---------------------------------------------------------------------------
+# Chrome CDP helpers — launch real Chrome on slot detection
+# ---------------------------------------------------------------------------
+
+def _find_chrome() -> str:
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def _is_cdp_up() -> bool:
+    try:
+        s = socket.create_connection(("127.0.0.1", 9222), timeout=1)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def launch_chrome_cdp(config) -> bool:
+    """
+    Launch Chrome with remote debugging on port 9222 using the dedicated visa
+    profile. Returns True once the CDP port is ready (up to 15s).
+    If Chrome is already listening on 9222, returns True immediately.
+    """
+    if _is_cdp_up():
+        return True
+
+    chrome = config.get("chrome_path") or _find_chrome()
+    if not chrome:
+        print("[Chrome] Could not find chrome.exe — add 'chrome_path' to config.json")
+        return False
+
+    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.Popen(
+            [
+                chrome,
+                "--remote-debugging-port=9222",
+                f"--user-data-dir={CHROME_PROFILE_DIR}",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    except Exception as e:
+        print(f"[Chrome] Launch failed: {e}")
+        return False
+
+    for _ in range(30):          # wait up to 15 s
+        time.sleep(0.5)
+        if _is_cdp_up():
+            return True
+    print("[Chrome] Timed out waiting for CDP port")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Fast-track booker — headed browser, auto-fill personal info, stop at captcha
 # ---------------------------------------------------------------------------
 
@@ -357,19 +427,41 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
     except Exception:
         pass
 
-    headless = not config.get("headed_on_book", True)
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless)
-            book_context = await browser.new_context(user_agent=USER_AGENT)
-            # Use cookies from the shared Playwright context — includes cf_clearance
-            # and other browser-set cookies that requests doesn't carry.
-            try:
-                cookie_list = await pw_context.cookies()
-                if cookie_list:
-                    await book_context.add_cookies(cookie_list)
-            except Exception as e:
-                print(f"[Booker] cookie inject failed: {e}")
+            # Prefer real Chrome via CDP — avoids Cloudflare bot detection entirely.
+            # launch_chrome_cdp() starts Chrome with the dedicated visa profile on port 9222
+            # (or connects if it's already running). Falls back to a plain Playwright
+            # browser with a Telegram warning if Chrome can't be found/started.
+            cdp_ok = await asyncio.get_event_loop().run_in_executor(
+                None, launch_chrome_cdp, config
+            )
+            using_cdp = False
+            if cdp_ok:
+                try:
+                    browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
+                    # Use the existing profile context so Cloudflare cookies are intact.
+                    book_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                    using_cdp = True
+                    print("[Booker] Connected to real Chrome via CDP")
+                except Exception as e:
+                    print(f"[Booker] CDP connect failed: {e} — falling back to Playwright browser")
+                    cdp_ok = False
+
+            if not cdp_ok:
+                send_telegram(
+                    "Fast-track: Chrome CDP unavailable — using fallback browser. "
+                    "Cloudflare may block. To fix: check README for chrome_visa_profile setup."
+                )
+                headless = not config.get("headed_on_book", True)
+                browser = await p.chromium.launch(headless=headless)
+                book_context = await browser.new_context(user_agent=USER_AGENT)
+                try:
+                    cookie_list = await pw_context.cookies()
+                    if cookie_list:
+                        await book_context.add_cookies(cookie_list)
+                except Exception as e:
+                    print(f"[Booker] cookie inject failed: {e}")
 
             page = await book_context.new_page()
 
@@ -440,14 +532,13 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                 failed.append(f"email: {e}")
 
             # Static text fields (handle readonly date inputs via JS)
-            DATE_KEYS = {"passport_expiry", "travel_date"}
             for sel, key in STATIC_TEXT_FIELDS.items():
                 value = profile.get(key, "")
                 if not value:
                     continue
                 try:
-                    # Date picker fields need dd/mm/yyyy not YYYY-MM-DD
-                    if key in DATE_KEYS:
+                    # passport_expiry is a readonly datepicker — inject dd/mm/yyyy via JS
+                    if key == "passport_expiry":
                         y, m, d = str(value).split("-")
                         value = f"{int(d):02d}/{int(m):02d}/{y}"
                     is_readonly = await page.eval_on_selector(sel, "el => el.readOnly")
@@ -473,6 +564,28 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                     filled.append(key)
                 except Exception as e:
                     failed.append(f"{key}: {e}")
+
+            # TravelDate: must use jQuery datepicker API (not el.value) to fire
+            # the changeDate event, which shows #apDate and sets the valid date
+            # range on the appointment datepicker. Must run AFTER TravelSubject is set.
+            travel_date_val = profile.get("travel_date", "")
+            if travel_date_val:
+                try:
+                    y, mo, d = str(travel_date_val).split("-")
+                    # Pass year/month/day separately; months are 0-indexed in JS Date
+                    await page.evaluate(
+                        "(args) => {"
+                        "  const date = new Date(args.y, args.m - 1, args.d);"
+                        "  const $td = $('#TravelDate');"
+                        "  if ($td.length) {"
+                        "    $td.datepicker('setDate', date);"
+                        "  }"
+                        "}",
+                        {"y": int(y), "m": int(mo), "d": int(d)},
+                    )
+                    filled.append("travel_date")
+                except Exception as e:
+                    failed.append(f"travel_date: {e}")
 
             # Prefill appointment date + fetch and inject time slots.
             times = []
@@ -578,6 +691,14 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                     print(f"  Submit captured: {base}.submit.json ({len(submit_captures)} requests)")
                 except Exception as e:
                     print(f"[Booker] submit dump failed: {e}")
+
+            # When using CDP we only close the tab — leave Chrome running so the
+            # profile stays warm for the next detection event.
+            if not using_cdp:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     except Exception as e:
         send_telegram(f"Fast-track booker crashed: {e}")

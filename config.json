@@ -19,5 +19,6 @@
   "screenshot_on_found": true,
   "auto_book": true,
   "headed_on_book": true,
-  "no_appointment_phrase": "Aktif Randevu Kotası Bulunmamaktadır"
+  "no_appointment_phrase": "Aktif Randevu Kotası Bulunmamaktadır",
+  "chrome_path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
 }
