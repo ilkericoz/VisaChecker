@@ -209,6 +209,11 @@ CAPTCHA_DATA_URI_RE = re.compile(
     re.IGNORECASE,
 )
 RECAPTCHA_KEY_RE = re.compile(r"recaptchaSiteKey\s*=\s*['\"]([^'\"]+)['\"]")
+# 6-digit verification code embedded in plain text inside the enteredCode label span
+ENTERED_CODE_RE = re.compile(
+    r'for="enteredCode"[^>]*>.*?<span[^>]*>(\d{5,6})</span>',
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def extract_inline_captcha(html):
@@ -288,6 +293,9 @@ def dump_forensic_bundle(base, *, http_session=None, html=None, dom_html=None,
             rk = RECAPTCHA_KEY_RE.search(html)
             if rk:
                 meta["recaptcha_site_key"] = rk.group(1)
+            ec = ENTERED_CODE_RE.search(html)
+            if ec:
+                meta["entered_code"] = ec.group(1)
         Path(f"{base}.meta.json").write_text(
             json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -496,6 +504,7 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                 )
                 return
 
+            page_load_time = time.time()
             filled, failed = [], []
 
             # Rotating fields by placeholder text
@@ -629,6 +638,23 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                 except Exception as e:
                     failed.append(f"appointment_time: {e}")
 
+            # Extract enteredCode — server embeds the 6-digit verification code
+            # as plain text in the label span; just read it from the DOM.
+            try:
+                entered_code = await page.evaluate(
+                    "() => { const lbl = document.querySelector('label[for=\"enteredCode\"]');"
+                    " if (!lbl) return null;"
+                    " const sp = lbl.querySelector('span');"
+                    " return sp ? sp.textContent.trim() : null; }"
+                )
+                if entered_code and re.match(r'^\d{5,6}$', entered_code):
+                    await page.fill('input[name="enteredCode"]', entered_code)
+                    filled.append(f"enteredCode ({entered_code})")
+                else:
+                    failed.append(f"enteredCode: not found in DOM ({entered_code!r})")
+            except Exception as e:
+                failed.append(f"enteredCode: {e}")
+
             # Persist booker outcome to forensics
             try:
                 Path(f"{base}.booker.json").write_text(
@@ -663,12 +689,63 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
             send_telegram(
                 f"Fast-track: filled {len(filled)} fields"
                 + (f", {len(failed)} failed" if failed else "")
-                + ".\nWindow is open — type the captcha + click Randevu Al."
+                + ".\nWaiting for anti-bot timer, then auto-submitting..."
                 + time_line
                 + (f"\nFailed: {'; '.join(failed[:5])}" if failed else "")
             )
 
-            # Hold the booker open until the user closes the page manually.
+            # Auto-submit: wait out the anti-bot timer, confirm Turnstile completed,
+            # click the submit button, and handle the two SweetAlert dialogs.
+            MIN_ELAPSED_SECS = 45  # server blocks submit if < 40s since page load
+            elapsed_so_far = time.time() - page_load_time
+            wait_more = max(2.0, MIN_ELAPSED_SECS - elapsed_so_far)
+            if wait_more > 2:
+                send_telegram(f"Fast-track: waiting {wait_more:.0f}s before submit (anti-bot timer)...")
+                await asyncio.sleep(wait_more)
+
+            # Poll for Cloudflare Turnstile to auto-complete and set cfToken (up to 20s)
+            cf_val = ""
+            for _ in range(40):
+                try:
+                    cf_val = await page.evaluate("() => document.getElementById('cfToken')?.value || ''")
+                except Exception:
+                    pass
+                if cf_val:
+                    break
+                await asyncio.sleep(0.5)
+
+            if not cf_val:
+                send_telegram(
+                    "Fast-track: Cloudflare Turnstile (cfToken) not set after 20s — "
+                    "leaving window open for manual submit."
+                )
+            else:
+                try:
+                    send_telegram("Fast-track: submitting...")
+                    await page.click('#randevuAlButton')
+                    # First SweetAlert: "Are you sure?" → Evet
+                    await page.wait_for_selector('.swal2-confirm', timeout=15_000)
+                    await page.click('.swal2-confirm')
+                    print("[Booker] Clicked SweetAlert Evet")
+                    # Second SweetAlert: "Redirecting..." → Tamam (may not appear on all paths)
+                    try:
+                        await page.wait_for_selector('.swal2-confirm', timeout=30_000)
+                        await page.click('.swal2-confirm')
+                        print("[Booker] Clicked SweetAlert Tamam")
+                    except Exception:
+                        pass
+                    # Wait for final page after redirect
+                    await page.wait_for_load_state('load', timeout=30_000)
+                    final_url = page.url
+                    ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    shot = f"{base}.success_{ts2}.png"
+                    await page.screenshot(path=shot, full_page=True)
+                    send_telegram(f"BOOKING SUBMITTED! Final URL: {final_url}")
+                    send_telegram_photo(shot, caption=f"Booking result — {entry['name']}")
+                except Exception as e:
+                    send_telegram(f"Fast-track: auto-submit failed: {e} — leaving window open.")
+
+            # Keep window open so user can see the result or intervene
             try:
                 await page.wait_for_event("close", timeout=0)
             except Exception:
