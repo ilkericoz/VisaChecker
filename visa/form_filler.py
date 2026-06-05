@@ -12,8 +12,106 @@ async def fill_form(page, profile, entry, http_session, picked_date):
     Fill all personal-info fields from the booking profile.
     Honeypot fields (hp_*) are never touched — only mapped fields are filled.
     Returns (filled, failed, times) where times is [{value, text}, ...] for the time select.
+
+    Fill order matters: selects (esp. TravelSubject) must come first because their
+    change events reset downstream DOM. Personal info is filled last so it survives.
     """
     filled, failed = [], []
+
+    # ── 1. Static selects ────────────────────────────────────────────────────
+    # TravelSubject must fire its changeDate handler before we touch anything else;
+    # it shows/hides sections and can wipe fields filled before it.
+    for sel, key in STATIC_SELECT_FIELDS.items():
+        value = profile.get(key, "")
+        if not value:
+            continue
+        try:
+            await page.select_option(sel, value)
+            filled.append(key)
+        except Exception as e:
+            failed.append(f"{key}: {e}")
+
+    # Brief pause to let TravelSubject's JS settle before touching date fields.
+    await asyncio.sleep(0.5)
+
+    # ── 2. TravelDate ────────────────────────────────────────────────────────
+    # Must run after TravelSubject; fires changeDate which reveals #apDate and
+    # sets the valid date range on the appointment datepicker.
+    travel_date_val = profile.get("travel_date", "")
+    if travel_date_val:
+        try:
+            y, mo, d = str(travel_date_val).split("-")
+            await page.evaluate(
+                "(args) => {"
+                "  const date = new Date(args.y, args.m - 1, args.d);"
+                "  const $td = $('#TravelDate');"
+                "  if ($td.length) { $td.datepicker('setDate', date); }"
+                "}",
+                {"y": int(y), "m": int(mo), "d": int(d)},
+            )
+            filled.append("travel_date")
+        except Exception as e:
+            failed.append(f"travel_date: {e}")
+
+    # ── 3. Appointment datepicker + time slots ────────────────────────────────
+    # Wait for #apDate to become visible (TravelDate's changeDate event shows it).
+    times = []
+    if picked_date:
+        try:
+            await page.wait_for_selector("#apDate", state="visible", timeout=5_000)
+        except Exception:
+            failed.append("datepicker: #apDate never appeared — TravelDate may not have fired correctly")
+
+        try:
+            y, mo, d = picked_date.split("-")
+            await page.evaluate(
+                "(args) => {"
+                "  const date = new Date(args.y, args.m - 1, args.d);"
+                "  const $dp = $('#datepicker');"
+                "  if ($dp.length) { $dp.datepicker('setDate', date); }"
+                "}",
+                {"y": int(y), "m": int(mo), "d": int(d)},
+            )
+            # Read back using instanceof check — new Date(NaN) is truthy but invalid
+            dp_actual = await page.evaluate(
+                "() => { const d = $('#datepicker').datepicker('getDate');"
+                " return (d instanceof Date && !isNaN(d)) ? d.toISOString().slice(0,10) : null; }"
+            )
+            if dp_actual:
+                filled.append(f"datepicker ({dp_actual})")
+            else:
+                failed.append("datepicker: widget returned null/invalid after setDate — date outside allowed range or #apDate not ready")
+        except Exception as e:
+            failed.append(f"datepicker: {e}")
+
+        try:
+            times = await asyncio.get_event_loop().run_in_executor(
+                None, fetch_available_times, http_session, entry, picked_date
+            )
+            if times:
+                await page.evaluate(
+                    "(slots) => {"
+                    "  const sel = document.getElementById('AppointmentTime');"
+                    "  if (!sel) return;"
+                    "  sel.innerHTML = '';"
+                    "  for (const s of slots) {"
+                    "    const o = document.createElement('option');"
+                    "    o.value = s.value; o.textContent = s.text;"
+                    "    sel.appendChild(o);"
+                    "  }"
+                    "  if (slots.length > 0) {"
+                    "    sel.value = slots[0].value;"
+                    "    sel.dispatchEvent(new Event('change',{bubbles:true}));"
+                    "  }"
+                    "}",
+                    times,
+                )
+                filled.append(f"appointment_time ({times[0].get('text','')})")
+        except Exception as e:
+            failed.append(f"appointment_time: {e}")
+
+    # ── 4. Personal info ──────────────────────────────────────────────────────
+    # Filled LAST so any select-triggered DOM resets don't wipe these values.
 
     # Rotating fields by placeholder text
     for placeholder, key in ROTATING_FIELD_PLACEHOLDERS.items():
@@ -70,7 +168,6 @@ async def fill_form(page, profile, entry, http_session, picked_date):
         if not value:
             continue
         try:
-            # passport_expiry is a readonly datepicker — inject dd/mm/yyyy via JS
             if key == "passport_expiry":
                 y, m, d = str(value).split("-")
                 value = f"{int(d):02d}/{int(m):02d}/{y}"
@@ -87,90 +184,7 @@ async def fill_form(page, profile, entry, http_session, picked_date):
         except Exception as e:
             failed.append(f"{key}: {e}")
 
-    # Static selects
-    for sel, key in STATIC_SELECT_FIELDS.items():
-        value = profile.get(key, "")
-        if not value:
-            continue
-        try:
-            await page.select_option(sel, value)
-            filled.append(key)
-        except Exception as e:
-            failed.append(f"{key}: {e}")
-
-    # TravelDate: must use jQuery datepicker API (not el.value) to fire
-    # the changeDate event, which shows #apDate and sets the valid date
-    # range on the appointment datepicker. Must run AFTER TravelSubject is set.
-    travel_date_val = profile.get("travel_date", "")
-    if travel_date_val:
-        try:
-            y, mo, d = str(travel_date_val).split("-")
-            await page.evaluate(
-                "(args) => {"
-                "  const date = new Date(args.y, args.m - 1, args.d);"
-                "  const $td = $('#TravelDate');"
-                "  if ($td.length) {"
-                "    $td.datepicker('setDate', date);"
-                "  }"
-                "}",
-                {"y": int(y), "m": int(mo), "d": int(d)},
-            )
-            filled.append("travel_date")
-        except Exception as e:
-            failed.append(f"travel_date: {e}")
-
-    # Prefill appointment date + fetch and inject time slots.
-    times = []
-    if picked_date:
-        try:
-            y, mo, d = picked_date.split("-")
-            await page.evaluate(
-                "(args) => {"
-                "  const date = new Date(args.y, args.m - 1, args.d);"
-                "  const $dp = $('#datepicker');"
-                "  if ($dp.length) { $dp.datepicker('setDate', date); }"
-                "}",
-                {"y": int(y), "m": int(mo), "d": int(d)},
-            )
-            # Read back the widget's internal date to confirm it registered
-            dp_actual = await page.evaluate(
-                "() => { const d = $('#datepicker').datepicker('getDate');"
-                " return d ? d.toISOString().slice(0,10) : null; }"
-            )
-            if dp_actual:
-                filled.append(f"datepicker ({dp_actual})")
-            else:
-                failed.append("datepicker: widget returned null after setDate — date may be outside allowed range or #apDate not visible yet")
-        except Exception as e:
-            failed.append(f"datepicker: {e}")
-
-        try:
-            times = await asyncio.get_event_loop().run_in_executor(
-                None, fetch_available_times, http_session, entry, picked_date
-            )
-            if times:
-                await page.evaluate(
-                    "(slots) => {"
-                    "  const sel = document.getElementById('AppointmentTime');"
-                    "  if (!sel) return;"
-                    "  sel.innerHTML = '';"
-                    "  for (const s of slots) {"
-                    "    const o = document.createElement('option');"
-                    "    o.value = s.value; o.textContent = s.text;"
-                    "    sel.appendChild(o);"
-                    "  }"
-                    "  if (slots.length > 0) {"
-                    "    sel.value = slots[0].value;"
-                    "    sel.dispatchEvent(new Event('change',{bubbles:true}));"
-                    "  }"
-                    "}",
-                    times,
-                )
-                filled.append(f"appointment_time ({times[0].get('text','')})")
-        except Exception as e:
-            failed.append(f"appointment_time: {e}")
-
-    # enteredCode — OCR the CAPTCHA PNG inside label[for="enteredCode"] img
+    # ── 5. enteredCode CAPTCHA ────────────────────────────────────────────────
     try:
         entered_code, err = await solve_entered_code(page)
         if entered_code:
