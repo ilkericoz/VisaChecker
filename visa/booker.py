@@ -77,9 +77,11 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
 
             page = await book_context.new_page()
 
-            # Capture every POST to the appointment domain.
-            # The "Randevu Al" submit fires one — save it for full-auto analysis.
+            # Capture every POST to the appointment domain — both outgoing payload
+            # and server response body, so a silent server-side rejection is visible.
             submit_captures = []
+            submit_responses = []
+
             def _on_request(request):
                 if request.method == "POST" and "appointment.as-visa.com" in request.url:
                     try:
@@ -96,7 +98,21 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                         })
                     except Exception:
                         pass
+
+            async def _on_response(response):
+                if response.request.method == "POST" and "appointment.as-visa.com" in response.url:
+                    try:
+                        body = await response.body()
+                        submit_responses.append({
+                            "url": response.url,
+                            "status": response.status,
+                            "body": body.decode("utf-8", errors="replace")[:4000],
+                        })
+                    except Exception:
+                        pass
+
             page.on("request", _on_request)
+            page.on("response", _on_response)
 
             await page.goto(entry["url"], timeout=30_000)
             try:
@@ -208,6 +224,12 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                     send_telegram(f"BOOKING SUBMITTED! Final URL: {final_url}")
                     send_telegram_photo(shot, caption=f"Booking result — {entry['name']}")
                 except Exception as e:
+                    try:
+                        shot_fail = f"{base}.fail_{datetime.now().strftime('%H%M%S')}.png"
+                        await page.screenshot(path=shot_fail, full_page=True)
+                        send_telegram_photo(shot_fail, caption=f"Auto-submit failed: {e}")
+                    except Exception:
+                        pass
                     send_telegram(f"Fast-track: auto-submit failed: {e} — leaving window open.")
 
             # Keep window open so user can see the result or intervene
@@ -216,21 +238,29 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
             except Exception:
                 pass
 
-            # Dump any POSTs captured while the window was open.
-            # The submit request is the key one — endpoint + full payload for future full-auto.
-            if submit_captures:
+            # Dump all POSTs (outgoing + server responses) captured while the window was open.
+            if submit_captures or submit_responses:
                 try:
                     Path(f"{base}.submit.json").write_text(
-                        json.dumps(submit_captures, indent=2, ensure_ascii=False),
+                        json.dumps({"requests": submit_captures, "responses": submit_responses},
+                                   indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
-                    last = submit_captures[-1]
-                    send_telegram(
-                        f"Submit captured ({len(submit_captures)} POST):\n"
-                        f"{last['url']}\n"
-                        f"Payload: {str(last.get('post_data', ''))[:400]}"
-                    )
-                    print(f"  Submit captured: {base}.submit.json ({len(submit_captures)} requests)")
+                    print(f"  Submit captured: {base}.submit.json "
+                          f"({len(submit_captures)} req, {len(submit_responses)} resp)")
+                    if submit_captures:
+                        last_req = submit_captures[-1]
+                        send_telegram(
+                            f"Submit captured ({len(submit_captures)} POST):\n"
+                            f"{last_req['url']}\n"
+                            f"Payload: {str(last_req.get('post_data', ''))[:300]}"
+                        )
+                    if submit_responses:
+                        last_resp = submit_responses[-1]
+                        send_telegram(
+                            f"Server response ({last_resp['status']}):\n"
+                            f"{last_resp['body'][:500]}"
+                        )
                 except Exception as e:
                     print(f"[Booker] submit dump failed: {e}")
 
