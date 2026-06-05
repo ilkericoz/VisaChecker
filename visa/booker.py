@@ -127,19 +127,6 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
             page_load_time = time.time()
             filled, failed, times = await fill_form(page, profile, entry, http_session, picked_date)
 
-            # Persist booker outcome to forensics
-            try:
-                Path(f"{base}.booker.json").write_text(
-                    json.dumps({
-                        "filled": filled, "failed": failed,
-                        "picked_date": picked_date, "label": label,
-                        "time_slots": times,
-                    }, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
-
             # Screenshot of the pre-filled form — sent to Telegram immediately
             # so you can verify field state even if you're away from the screen.
             try:
@@ -183,6 +170,33 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                 rc_val = await page.evaluate("() => document.getElementById('recaptchaToken')?.value || ''")
             except Exception:
                 pass
+
+            # Snapshot every visible form field value right before submit.
+            # This is the ground truth for what will actually be sent — catches any
+            # field that silently failed to register (widget state, readonly inputs, etc).
+            form_state = {}
+            try:
+                form_state = await page.evaluate(
+                    "() => {"
+                    "  const out = {};"
+                    "  document.querySelectorAll('#apForm input, #apForm select, #apForm textarea').forEach(el => {"
+                    "    const key = el.name || el.id;"
+                    "    if (key && !key.startsWith('hp_')) out[key] = el.value;"
+                    "  });"
+                    "  return out;"
+                    "}"
+                )
+                Path(f"{base}.booker.json").write_text(
+                    json.dumps({
+                        "filled": filled, "failed": failed,
+                        "picked_date": picked_date, "label": label,
+                        "time_slots": times,
+                        "form_state_pre_submit": form_state,
+                    }, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"[Booker] pre-submit form dump failed: {e}")
 
             if not cf_val:
                 send_telegram(

@@ -132,8 +132,17 @@ async def fill_form(page, profile, entry, http_session, picked_date):
                 "}",
                 {"y": int(y), "m": int(mo), "d": int(d)},
             )
-        except Exception:
-            pass
+            # Read back the widget's internal date to confirm it registered
+            dp_actual = await page.evaluate(
+                "() => { const d = $('#datepicker').datepicker('getDate');"
+                " return d ? d.toISOString().slice(0,10) : null; }"
+            )
+            if dp_actual:
+                filled.append(f"datepicker ({dp_actual})")
+            else:
+                failed.append("datepicker: widget returned null after setDate — date may be outside allowed range or #apDate not visible yet")
+        except Exception as e:
+            failed.append(f"datepicker: {e}")
 
         try:
             times = await asyncio.get_event_loop().run_in_executor(
