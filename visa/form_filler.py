@@ -123,13 +123,14 @@ async def fill_form(page, profile, entry, http_session, picked_date):
     times = []
     if picked_date:
         try:
-            # Format datepicker expects dd/mm/yyyy
             y, mo, d = picked_date.split("-")
-            date_for_picker = f"{int(d):02d}/{int(mo):02d}/{y}"
             await page.evaluate(
-                "(v) => { const el = document.getElementById('datepicker');"
-                " if (el) { el.value = v; el.dispatchEvent(new Event('change',{bubbles:true})); } }",
-                date_for_picker,
+                "(args) => {"
+                "  const date = new Date(args.y, args.m - 1, args.d);"
+                "  const $dp = $('#datepicker');"
+                "  if ($dp.length) { $dp.datepicker('setDate', date); }"
+                "}",
+                {"y": int(y), "m": int(mo), "d": int(d)},
             )
         except Exception:
             pass
