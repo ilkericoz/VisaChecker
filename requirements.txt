@@ -2,3 +2,5 @@ playwright
 plyer
 python-dotenv
 requests
+ddddocr
+pillow

@@ -27,6 +27,9 @@ found_*.tarih.json
 found_*.booker.json
 found_*.submit.json
 
+# Chrome profile with live Cloudflare cookies — never commit
+chrome_visa_profile/
+
 # Claude Code local config
 .claude/
 
