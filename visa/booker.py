@@ -7,10 +7,10 @@ from pathlib import Path
 import winsound
 from playwright.async_api import async_playwright
 
-from visa.config import CHROME_CDP_URL, USER_AGENT
+from visa.config import USER_AGENT
 from visa.telegram import send_telegram, send_telegram_photo
-from visa.browser import launch_chrome_cdp
-from visa.captcha import solve_turnstile
+from visa.browser import launch_chrome_cdp, cdp_url
+from visa.captcha import solve_entered_code, solve_turnstile
 from visa.date_api import pick_date
 from visa.form_filler import fill_form
 
@@ -51,9 +51,33 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
             using_cdp = False
             if cdp_ok:
                 try:
-                    browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
+                    browser = await p.chromium.connect_over_cdp(cdp_url(config))
                     # Use the existing profile context so Cloudflare cookies are intact.
                     book_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+                    # Guard against attaching to the WRONG Chrome — e.g. another bot
+                    # (FareHarbor) already holds this port with a different profile.
+                    # If we see a foreign tab, the session/cookies aren't ours and a
+                    # submit would look like "unusual activity" to the server.
+                    try:
+                        foreign = []
+                        for ctx in browser.contexts:
+                            for pg in ctx.pages:
+                                u = (pg.url or "").lower()
+                                if u and "as-visa.com" not in u and "about:blank" not in u and "newtab" not in u:
+                                    foreign.append(pg.url)
+                        if foreign:
+                            send_telegram(
+                                "Fast-track: ABORTED — connected Chrome has foreign tabs "
+                                f"({foreign[:2]}). Another bot is likely sharing CDP port "
+                                f"{cdp_url(config)}. Give each bot its own cdp_port + profile. "
+                                "Not submitting with a contaminated session."
+                            )
+                            print(f"[Booker] Foreign tabs on shared CDP: {foreign}")
+                            return
+                    except Exception as _ge:
+                        print(f"[Booker] foreign-tab guard error: {_ge}")
+
                     using_cdp = True
                     print("[Booker] Connected to real Chrome via CDP")
                 except Exception as e:
@@ -76,6 +100,21 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                     print(f"[Booker] cookie inject failed: {e}")
 
             page = await book_context.new_page()
+
+            # Scrub Playwright automation markers before any page loads.
+            # CDP connection sets window.__playwright and similar properties that
+            # Cloudflare Turnstile uses to detect automated browsers.
+            # NOTE: we do NOT touch navigator.webdriver here — the
+            # --disable-blink-features=AutomationControlled launch flag already
+            # makes it report the native `false`. Forcing it to `undefined` in JS
+            # is a stronger tell than leaving it false, so we leave it alone.
+            await page.add_init_script("""
+                try { delete window.__playwright; } catch(e) {}
+                try { delete window.__pwInitScripts; } catch(e) {}
+                try { delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array; } catch(e) {}
+                try { delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise; } catch(e) {}
+            """)
+
 
             # Capture every POST to the appointment domain — both outgoing payload
             # and server response body, so a silent server-side rejection is visible.
@@ -124,6 +163,14 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                 )
                 return
 
+            # Capture JS-rendered DOM for diagnostics (form fields injected by wizard JS
+            # won't appear in the HTTP response snapshot — this captures what's actually there).
+            try:
+                dom_html = await page.content()
+                Path(f"{base}.dom.html").write_text(dom_html, encoding="utf-8")
+            except Exception as _de:
+                print(f"[Booker] DOM capture failed: {_de}")
+
             page_load_time = time.time()
             filled, failed, times = await fill_form(page, profile, entry, http_session, picked_date)
 
@@ -153,14 +200,55 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                 + (f"\nFailed: {'; '.join(failed[:5])}" if failed else "")
             )
 
-            # Auto-submit: wait out the anti-bot timer, confirm Turnstile completed,
-            # click the submit button, and handle the two SweetAlert dialogs.
-            MIN_ELAPSED_SECS = 45  # server blocks submit if < 40s since page load
-            elapsed_so_far = time.time() - page_load_time
+            # Auto-submit: wait out the anti-bot dwell timer, confirm Turnstile
+            # completed, click submit, and handle the two SweetAlert dialogs.
+            #
+            # The server rejects with "işleminiz çok hızlı yapıldığı için ... bot
+            # olarak algıladı" if (now - formStartTime) is under its threshold.
+            # formStartTime is a hidden field the page JS sets on load (epoch ms).
+            # We gate on THAT field — the server's own reference clock — rather
+            # than our local page_load_time, since the two can drift apart.
+            MIN_ELAPSED_SECS = 60  # margin over observed ~40s server threshold
+
+            async def _server_elapsed():
+                try:
+                    fst = await page.evaluate(
+                        "() => document.getElementById('formStartTime')?.value || ''"
+                    )
+                    if fst and fst.isdigit():
+                        return (time.time() * 1000 - int(fst)) / 1000.0
+                except Exception:
+                    pass
+                # Fall back to our local clock if the field is missing/unreadable.
+                return time.time() - page_load_time
+
+            elapsed_so_far = await _server_elapsed()
             wait_more = max(2.0, MIN_ELAPSED_SECS - elapsed_so_far)
             if wait_more > 2:
-                send_telegram(f"Fast-track: waiting {wait_more:.0f}s before submit (anti-bot timer)...")
+                send_telegram(
+                    f"Fast-track: dwell so far {elapsed_so_far:.0f}s — waiting "
+                    f"{wait_more:.0f}s more before submit (anti-bot timer)..."
+                )
                 await asyncio.sleep(wait_more)
+            # Re-check after sleeping in case formStartTime resolved differently.
+            final_elapsed = await _server_elapsed()
+            if final_elapsed < MIN_ELAPSED_SECS:
+                extra = MIN_ELAPSED_SECS - final_elapsed
+                await asyncio.sleep(extra)
+
+            # Fill enteredCode CAPTCHA here — NOT during form fill — because the
+            # 6-digit code expires in ~60s and the anti-bot timer eats most of that.
+            try:
+                entered_code, ec_err = await solve_entered_code(page)
+                if entered_code:
+                    await page.fill('input[name="enteredCode"]', entered_code)
+                    filled.append(f"enteredCode ({entered_code})")
+                    print(f"[Booker] enteredCode filled: {entered_code}")
+                else:
+                    failed.append(f"enteredCode: {ec_err}")
+                    send_telegram(f"Fast-track: enteredCode solve failed: {ec_err}")
+            except Exception as _ee:
+                failed.append(f"enteredCode: {_ee}")
 
             cf_val = await solve_turnstile(page)
 

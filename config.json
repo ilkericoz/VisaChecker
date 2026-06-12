@@ -4,13 +4,17 @@
       "name": "Istanbul",
       "url": "https://appointment.as-visa.com/tr/istanbul-bireysel-basvuru",
       "tarih_getir_path": "/Macaristan/TarihGetir",
-      "saat_getir_path": "/Macaristan/SaatGetir"
+      "saat_getir_path": "/Macaristan/SaatGetir",
+      "min_gap_days": 15,
+      "max_gap_days": 60
     },
     {
       "name": "Ankara",
       "url": "https://appointment.as-visa.com/tr/ankara-bireysel-basvuru",
       "tarih_getir_path": "/AnBir/Macaristan/TarihGetir",
-      "saat_getir_path": "/AnBir/Macaristan/SaatGetir"
+      "saat_getir_path": "/AnBir/Macaristan/SaatGetir",
+      "min_gap_days": 17,
+      "max_gap_days": 60
     }
   ],
   "check_interval_min_seconds": 60,
@@ -20,5 +24,6 @@
   "auto_book": true,
   "headed_on_book": true,
   "no_appointment_phrase": "Aktif Randevu Kotası Bulunmamaktadır",
-  "chrome_path": "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
+  "chrome_path": "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+  "cdp_port": 9222
 }

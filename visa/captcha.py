@@ -7,9 +7,30 @@ from visa.telegram import send_telegram
 
 async def solve_entered_code(page):
     """
-    OCR the enteredCode CAPTCHA image via ddddocr.
+    Read the 6-digit enteredCode verification code from the page.
+    Both cities now render it as plain text in a <span> inside the label.
+    Old Ankara used a base64 PNG image — OCR fallback kept for safety.
     Returns (code_str, None) on success, (None, error_detail) on failure.
     """
+    # Plain-text span (Istanbul + new Ankara)
+    try:
+        code = await page.evaluate(
+            "() => {"
+            "  const label = document.querySelector('label[for=\"enteredCode\"]');"
+            "  if (!label) return null;"
+            "  for (const span of label.querySelectorAll('span')) {"
+            "    const t = span.textContent.replace(/\\D/g, '').slice(0, 6);"
+            "    if (t.length >= 5) return t;"
+            "  }"
+            "  return null;"
+            "}"
+        )
+        if code:
+            return code, None
+    except Exception:
+        pass
+
+    # Base64 PNG fallback (old Ankara form — kept in case it returns)
     try:
         import base64 as _b64
         import html as _html_mod
@@ -20,7 +41,7 @@ async def solve_entered_code(page):
             " return img ? img.src : null; }"
         )
         if not (img_src and ',' in img_src):
-            return None, f"OCR got None from img_src={'missing'}"
+            return None, "no span text and no img found — label not rendered yet or selector changed"
         _, b64data = img_src.split(',', 1)
         png_bytes = _b64.b64decode(_html_mod.unescape(b64data))
         _ocr = _ddddocr.DdddOcr(show_ad=False)
