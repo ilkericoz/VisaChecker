@@ -41,10 +41,13 @@ STATIC_SELECT_FIELDS = {
     'select#TravelSubject':    "travel_purpose",
 }
 
+# Aligned with the actually-installed Chrome (149) that the booker drives, so the
+# requests poller and the Playwright contexts present a current, consistent UA
+# instead of the old hard-coded Chrome/124.
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Chrome/149.0.0.0 Safari/537.36"
 )
 
 

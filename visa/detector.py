@@ -5,6 +5,10 @@ import time
 from datetime import datetime, date
 from pathlib import Path
 
+# Plain requests, deliberately. We tested curl_cffi (impersonate=chrome) to get a
+# browser JA3 — the appointment server actively DROPS those connections ("empty
+# reply from server") while answering plain requests with a clean 200, and the
+# polling path doesn't even need a cf_clearance cookie. So requests is correct here.
 import requests as req_lib
 import winsound
 from plyer import notification

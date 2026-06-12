@@ -30,12 +30,18 @@ async def run():
     print(f"Cities: {', '.join(e['name'] for e in urls)}\n")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=config["headless"])
+        # --disable-blink-features=AutomationControlled makes navigator.webdriver
+        # report the NATIVE `false` (default automated Chromium reports `true`,
+        # which Cloudflare blocks — and masking it to `undefined` in JS is itself a
+        # tell). With the flag, no JS patch is needed. This is the browser that
+        # bootstraps the session cookies and serves as the Playwright fallback, so
+        # it has to clear Cloudflare cleanly. (Same approach as browser.py.)
+        browser = await p.chromium.launch(
+            headless=config["headless"],
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         context = await browser.new_context(user_agent=USER_AGENT)
         page = await context.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
 
         page_lock = asyncio.Lock()
 
