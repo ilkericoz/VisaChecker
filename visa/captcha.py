@@ -60,10 +60,26 @@ async def solve_turnstile(page):
     Falls back to CapSolver if not completed.
     Returns token string or empty string.
     """
+    # Turnstile auto-completion populates the widget's own `cf-turnstile-response`
+    # field; the site's onTurnstileSuccess callback then mirrors it into `cfToken`.
+    # Poll BOTH so a slow/renamed callback doesn't make us miss a real solve — if
+    # only the standard field is set, copy it into cfToken before returning.
     cf_val = ""
     for _ in range(40):
         try:
-            cf_val = await page.evaluate("() => document.getElementById('cfToken')?.value || ''")
+            cf_val = await page.evaluate(
+                "() => {"
+                "  const a = document.getElementById('cfToken')?.value || '';"
+                "  if (a) return a;"
+                "  const b = document.querySelector('input[name=\"cf-turnstile-response\"]')?.value || '';"
+                "  if (b) {"
+                "    const el = document.getElementById('cfToken');"
+                "    if (el && !el.value) el.value = b;"
+                "    return b;"
+                "  }"
+                "  return '';"
+                "}"
+            )
         except Exception:
             pass
         if cf_val:
@@ -90,11 +106,26 @@ async def solve_turnstile(page):
             )
             cf_val = solution.get("token", "")
             if cf_val:
+                # A real Turnstile solve does two things the site relies on:
+                #   1. the widget fills its own `cf-turnstile-response` hidden input
+                #   2. the data-callback `onTurnstileSuccess(token)` runs, which is
+                #      the site's JS that populates `cfToken`.
+                # Injecting only into cfToken skips both the standard response field
+                # (which the server validates) and any side effects of the callback,
+                # so we replicate all three.
                 await page.evaluate(
-                    "(t) => { const el = document.getElementById('cfToken'); if (el) el.value = t; }",
+                    "(t) => {"
+                    "  const set = (el) => { if (el) { el.value = t;"
+                    "    el.dispatchEvent(new Event('change', { bubbles: true })); } };"
+                    "  set(document.getElementById('cfToken'));"
+                    "  set(document.querySelector('input[name=\"cf-turnstile-response\"]'));"
+                    "  try { if (typeof onTurnstileSuccess === 'function') onTurnstileSuccess(t); }"
+                    "  catch (e) {}"
+                    "}",
                     cf_val,
                 )
-                send_telegram("Fast-track: CapSolver Turnstile token injected.")
+                send_telegram("Fast-track: CapSolver Turnstile token injected "
+                              "(cfToken + cf-turnstile-response + callback).")
         except Exception as _ce:
             send_telegram(f"Fast-track: CapSolver failed: {_ce}")
     else:
