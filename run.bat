@@ -1,17 +1,45 @@
 @echo off
-REM Launch the visa bot using the project's venv interpreter — NOT system Python.
-REM System Python (the Windows Store python.exe on PATH) lacks ddddocr / capsolver /
-REM curl_cffi, so running the bot with bare `python` silently breaks the CAPTCHA
-REM solver and the Turnstile fallback. Always start it through this script.
 cd /d "%~dp0"
+title Visa Bot
 
+echo ============================================================
+echo  Visa Appointment Bot
+echo ============================================================
+echo.
+
+REM --- venv check ---
 if not exist "venv\Scripts\python.exe" (
-    echo [run.bat] venv not found at venv\Scripts\python.exe
-    echo Create it first:  python -m venv venv ^&^& venv\Scripts\pip install -r requirements.txt
+    echo [ERROR] venv not found. Run this once to set it up:
+    echo   python -m venv venv
+    echo   venv\Scripts\pip install -r requirements.txt
+    echo.
     pause
     exit /b 1
 )
 
-echo [run.bat] Starting visa bot with venv interpreter...
+REM --- booking profile check ---
+if not exist "booking_profile.json" (
+    echo [ERROR] booking_profile.json not found.
+    echo Copy booking_profile.example.json to booking_profile.json and fill in your details.
+    echo.
+    pause
+    exit /b 1
+)
+
+REM --- warn if still using placeholder data ---
+findstr /i "Ahmet Yilmaz" booking_profile.json >nul 2>&1
+if %errorlevel%==0 (
+    echo [WARNING] booking_profile.json still has placeholder data!
+    echo           The bot will try to book with FAKE personal info.
+    echo           Update the file with your real details before a real booking.
+    echo.
+    echo Press any key to run anyway, or close this window to cancel.
+    pause >nul
+)
+
+echo [OK] Launching bot...
+echo.
 "venv\Scripts\python.exe" -m visa
+echo.
+echo Bot stopped.
 pause

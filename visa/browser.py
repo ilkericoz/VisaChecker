@@ -88,9 +88,12 @@ def launch_chrome_cdp(config) -> bool:
         print(f"[Chrome] Launch failed: {e}")
         return False
 
+    print("[Chrome] Chrome is opening for booking — this is normal, DO NOT close it.")
+    print("[Chrome] The bot will navigate and fill the form automatically...")
     for _ in range(30):          # wait up to 15 s
         time.sleep(0.5)
         if _is_cdp_up(port):
+            print("[Chrome] Ready.")
             return True
     print("[Chrome] Timed out waiting for CDP port")
     return False

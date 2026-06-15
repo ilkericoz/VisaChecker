@@ -120,6 +120,10 @@ async def run():
                     save_daily_snapshot(entry["name"], html)
 
                     if available:
+                        print(f"\n{'='*60}")
+                        print(f"  SLOT FOUND: {entry['name']} — starting auto-book")
+                        print(f"  Chrome will open. DO NOT close it — the bot is booking.")
+                        print(f"{'='*60}\n")
                         notify(entry["name"], entry["url"], method="HTTP")
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                         base = f"found_{entry['name']}_{ts}"
@@ -219,6 +223,10 @@ async def run():
                             save_daily_snapshot(entry["name"], html)
 
                             if available:
+                                print(f"\n{'='*60}")
+                                print(f"  SLOT FOUND: {entry['name']} — starting auto-book")
+                                print(f"  Chrome will open. DO NOT close it — the bot is booking.")
+                                print(f"{'='*60}\n")
                                 notify(entry["name"], entry["url"], method="Playwright")
                                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                                 base = f"found_{entry['name']}_{ts}"
