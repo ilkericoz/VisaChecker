@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 from visa.config import USER_AGENT
 from visa.telegram import send_telegram, send_telegram_photo
 from visa.browser import launch_chrome_cdp, cdp_url
-from visa.captcha import solve_entered_code, solve_turnstile
+from visa.captcha import solve_entered_code, solve_recaptcha, solve_turnstile
 from visa.date_api import pick_date
 from visa.form_filler import fill_form
 
@@ -64,7 +64,7 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                         for ctx in browser.contexts:
                             for pg in ctx.pages:
                                 u = (pg.url or "").lower()
-                                if u and "as-visa.com" not in u and "about:blank" not in u and "newtab" not in u:
+                                if u and "as-visa.com" not in u and "about:blank" not in u and "newtab" not in u and "chrome://" not in u:
                                     foreign.append(pg.url)
                         if foreign:
                             send_telegram(
@@ -251,13 +251,7 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
                 failed.append(f"enteredCode: {_ee}")
 
             cf_val = await solve_turnstile(page)
-
-            # Also read recaptchaToken for diagnostics
-            rc_val = ""
-            try:
-                rc_val = await page.evaluate("() => document.getElementById('recaptchaToken')?.value || ''")
-            except Exception:
-                pass
+            rc_val = await solve_recaptcha(page)
 
             # Snapshot every visible form field value right before submit.
             # This is the ground truth for what will actually be sent — catches any
@@ -286,45 +280,91 @@ async def fast_track_book(entry, http_session, pw_context, profile, tarih_result
             except Exception as e:
                 print(f"[Booker] pre-submit form dump failed: {e}")
 
-            if not cf_val:
+            try:
+                rc_required = bool(await page.evaluate("() => !!window.recaptchaSiteKey"))
+            except Exception:
+                rc_required = False
+
+            captcha_ok = cf_val and (not rc_required or rc_val)
+
+            # Shared post-submit handler: dismisses confirmation dialogs, captures result.
+            async def _handle_post_submit():
+                # First SweetAlert: "Are you sure?" → Evet
+                await page.wait_for_selector('.swal2-confirm', timeout=15_000)
+                await page.click('.swal2-confirm')
+                print("[Booker] Clicked SweetAlert Evet")
+                # Second SweetAlert: result/redirect → Tamam
+                try:
+                    await page.wait_for_selector('.swal2-confirm', timeout=30_000)
+                    # Screenshot the dialog before dismissing — contains server message
+                    ts_d = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    shot_d = f"{base}.dialog_{ts_d}.png"
+                    try:
+                        await page.screenshot(path=shot_d, full_page=True)
+                        send_telegram_photo(shot_d, caption="Server response dialog")
+                    except Exception:
+                        pass
+                    await page.click('.swal2-confirm')
+                    print("[Booker] Clicked SweetAlert Tamam")
+                except Exception:
+                    pass
+                await page.wait_for_load_state('load', timeout=30_000)
+                final_url = page.url
+                ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
+                shot = f"{base}.success_{ts2}.png"
+                await page.screenshot(path=shot, full_page=True)
+                send_telegram(f"BOOKING SUBMITTED! Final URL: {final_url}")
+                send_telegram_photo(shot, caption=f"Booking result — {entry['name']}")
+
+            # Dismiss informational SweetAlert (appears on page load, unrelated to submit)
+            async def _dismiss_info_popup():
+                try:
+                    if await page.query_selector('.swal2-popup:visible'):
+                        await page.click('.swal2-confirm')
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+            if not captcha_ok:
+                missing = []
+                if not cf_val:
+                    missing.append("cfToken")
+                if rc_required and not rc_val:
+                    missing.append("recaptchaToken")
                 send_telegram(
-                    f"Fast-track: cfToken still empty after CapSolver attempt — "
-                    f"recaptchaToken={'set' if rc_val else 'empty'} — "
+                    f"Fast-track: CAPTCHA unsolved ({', '.join(missing)}) — "
                     "leaving window open for manual submit."
                 )
+            elif profile.get("manual_submit", False):
+                # Manual submit mode: bot preps everything, user clicks the button.
+                # Bot watches dialogs and captures the server response.
+                await _dismiss_info_popup()
+                msg = (
+                    f"READY TO SUBMIT — {entry['name']} {picked_date} {times[0]['text'] if times else ''}\n"
+                    f"cfToken: set | recaptchaToken: {'set' if rc_val else 'n/a'}\n"
+                    "Click RANDEVU AL in Chrome now. I will handle the confirmation dialogs."
+                )
+                send_telegram(msg)
+                print(f"\n[Booker] *** MANUAL SUBMIT MODE — click the button in Chrome ***\n")
+                try:
+                    await _handle_post_submit()
+                except Exception as e:
+                    try:
+                        shot_fail = f"{base}.fail_{datetime.now().strftime('%H%M%S')}.png"
+                        await page.screenshot(path=shot_fail, full_page=True)
+                        send_telegram_photo(shot_fail, caption=f"Post-submit capture: {e}")
+                    except Exception:
+                        pass
+                    send_telegram(f"Fast-track: post-submit capture failed: {e}")
             else:
                 try:
-                    # Dismiss any informational SweetAlert that appeared during form fill
-                    try:
-                        if await page.query_selector('.swal2-popup:visible'):
-                            await page.click('.swal2-confirm')
-                            await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
+                    await _dismiss_info_popup()
                     send_telegram(
                         f"Fast-track: submitting... "
-                        f"(cfToken=set, recaptchaToken={'set' if rc_val else 'empty'})"
+                        f"(cfToken=set, recaptchaToken={'set' if rc_val else 'n/a'})"
                     )
                     await page.click('#randevuAlButton')
-                    # First SweetAlert: "Are you sure?" → Evet
-                    await page.wait_for_selector('.swal2-confirm', timeout=15_000)
-                    await page.click('.swal2-confirm')
-                    print("[Booker] Clicked SweetAlert Evet")
-                    # Second SweetAlert: "Redirecting..." → Tamam (may not appear on all paths)
-                    try:
-                        await page.wait_for_selector('.swal2-confirm', timeout=30_000)
-                        await page.click('.swal2-confirm')
-                        print("[Booker] Clicked SweetAlert Tamam")
-                    except Exception:
-                        pass
-                    # Wait for final page after redirect
-                    await page.wait_for_load_state('load', timeout=30_000)
-                    final_url = page.url
-                    ts2 = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    shot = f"{base}.success_{ts2}.png"
-                    await page.screenshot(path=shot, full_page=True)
-                    send_telegram(f"BOOKING SUBMITTED! Final URL: {final_url}")
-                    send_telegram_photo(shot, caption=f"Booking result — {entry['name']}")
+                    await _handle_post_submit()
                 except Exception as e:
                     try:
                         shot_fail = f"{base}.fail_{datetime.now().strftime('%H%M%S')}.png"
