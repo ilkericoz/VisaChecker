@@ -166,25 +166,30 @@ async def run_capture(city: str = "Istanbul"):
             });
         """)
 
-        # ── Navigate to booking page ───────────────────────────────────────
-        # Hit the root domain first so Cloudflare issues its cookies/challenge
-        # on a plain page, then navigate to the booking URL. Going straight to
-        # the booking URL on a cold profile triggers the JS challenge and blocks.
-        print(f"[Capture] Warming Cloudflare via root domain ...")
-        try:
-            await page.goto("https://appointment.as-visa.com", timeout=20_000)
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
-        await asyncio.sleep(3)
-        print(f"[Capture] Navigating to {booking_url} ...")
-        await page.goto(booking_url, timeout=30_000)
+        # ── Wait for user to navigate to booking page ─────────────────────
+        # We do NOT navigate automatically — Cloudflare trusts the user's
+        # real browsing but blocks CDP-driven navigation on a cold profile.
+        # Open a blank tab and let the user go there themselves.
+        print(f"\n[Capture] *** Chrome is open. ***")
+        print(f"[Capture] Navigate yourself to:")
+        print(f"[Capture]   {booking_url}")
+        print(f"[Capture] Waiting for you to land on the page...")
 
+        # Wait until the page URL contains the booking domain
+        while True:
+            try:
+                if "as-visa.com" in page.url:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+        print(f"[Capture] Detected! Recording from here. Fill and submit the form.")
         send_telegram(
             f"Manual capture started — {city}\n"
             "Go ahead and fill + submit the form. Everything is being recorded."
         )
-        print("\n[Capture] *** Browser is open. Do the booking manually. ***")
+        print("\n[Capture] *** Do the booking manually. ***")
         print("[Capture] Press Ctrl+C here when done to save the full bundle.\n")
 
         # Periodic screenshot every 30s while on the booking page
