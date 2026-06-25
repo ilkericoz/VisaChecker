@@ -82,6 +82,14 @@ async def run_capture(city: str = "Istanbul"):
         ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = await ctx.new_page()
 
+        # Scrub Playwright automation markers — same as booker.py.
+        await page.add_init_script("""
+            try { delete window.__playwright; } catch(e) {}
+            try { delete window.__pwInitScripts; } catch(e) {}
+            try { delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array; } catch(e) {}
+            try { delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise; } catch(e) {}
+        """)
+
         # ── Network capture ────────────────────────────────────────────────
         def _on_request(req):
             entry_r = {
