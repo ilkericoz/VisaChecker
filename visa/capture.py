@@ -167,6 +167,16 @@ async def run_capture(city: str = "Istanbul"):
         """)
 
         # ── Navigate to booking page ───────────────────────────────────────
+        # Hit the root domain first so Cloudflare issues its cookies/challenge
+        # on a plain page, then navigate to the booking URL. Going straight to
+        # the booking URL on a cold profile triggers the JS challenge and blocks.
+        print(f"[Capture] Warming Cloudflare via root domain ...")
+        try:
+            await page.goto("https://appointment.as-visa.com", timeout=20_000)
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
+        await asyncio.sleep(3)
         print(f"[Capture] Navigating to {booking_url} ...")
         await page.goto(booking_url, timeout=30_000)
 
