@@ -109,11 +109,23 @@ async def run_capture(city: str = "Istanbul"):
                 body = (await resp.body()).decode("utf-8", errors="replace")
             except Exception:
                 body = ""
+            # Keep the full body for the booking-page HTML AND for the site's JS.
+            # The submit-button wiring and the "Emin misiniz?" SweetAlert flow are
+            # pure client-side JS (they make no network request of their own), and
+            # they usually live in an external /PageJs/*.js file rather than inline —
+            # so we must retain full JS bodies to see how the automated submit works.
+            # Everything else is capped so the bundle doesn't balloon.
+            u = resp.url.lower()
+            keep_full = (
+                u.rstrip("/").endswith("bireysel-basvuru")
+                or u.endswith(".js")
+                or "/pagejs/" in u
+            )
             entry_r = {
                 "ts": datetime.now().isoformat(),
                 "status": resp.status,
                 "url": resp.url,
-                "body": body[:4000],
+                "body": body if keep_full else body[:4000],
             }
             responses_log.append(entry_r)
             if resp.request.method == "POST":
@@ -146,6 +158,17 @@ async def run_capture(city: str = "Istanbul"):
                         screenshots.append({"n": shot_count[0], "label": "periodic", "path": path, "url": page.url})
                     except Exception:
                         pass
+                    # Snapshot the LIVE rendered form DOM while we're on the booking
+                    # page. The final DOM dump only fires on close (which lands on the
+                    # confirmation page), so without this we never capture the form's
+                    # actual submit button / dialog markup. Overwrite one file so we
+                    # always keep the most recent pre-submit form state.
+                    if page.url.rstrip("/").endswith("bireysel-basvuru"):
+                        try:
+                            form_dom = await page.content()
+                            Path(f"{base}.form_dom.html").write_text(form_dom, encoding="utf-8")
+                        except Exception:
+                            pass
 
         periodic_task = asyncio.ensure_future(_periodic())
 

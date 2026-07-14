@@ -19,6 +19,9 @@ probe_recent_panel.py
 Ankara source files/
 Istanbul source files/
 
+# Manual-capture bundles — contain real applicant PII (passport, TC kimlik). Never commit.
+capture_*.json
+
 # Runtime forensic dumps
 found_*.json
 found_*.cookies.json
