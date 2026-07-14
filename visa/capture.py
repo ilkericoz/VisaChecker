@@ -22,6 +22,7 @@ Design constraints (important):
 import asyncio
 import hashlib
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -267,11 +268,18 @@ async def run_capture(city: str = "Istanbul"):
                     continue
 
                 h = hashlib.md5(dom.encode("utf-8", "replace")).hexdigest()
-                # A SweetAlert / modal presence is detectable purely from the DOM
-                # string we already have — no extra in-page call needed.
-                low = dom.lower()
-                has_dialog = ("swal2-popup" in low or "swal2-container" in low
-                              or "modal show" in low or 'role="dialog"' in low)
+                # A SweetAlert / modal is detectable purely from the DOM string we
+                # already have — no extra in-page call needed. But we must match an
+                # actually-rendered element, NOT the SweetAlert CSS/JS that is always
+                # embedded in the page: `swal2-popup` etc. appear in the stylesheet and
+                # library source at all times. SweetAlert injects a real
+                # `<div class="swal2-container ...">` and sets `swal2-shown` on <body>
+                # ONLY while a dialog is open, so anchor the match to those elements.
+                has_dialog = bool(
+                    re.search(r'<div[^>]*class="[^"]*swal2-container', dom)
+                    or re.search(r'<body[^>]*class="[^"]*swal2-shown', dom)
+                    or re.search(r'<div[^>]*class="[^"]*modal[^"]*\bshow\b', dom)
+                )
 
                 if h != last_hash:
                     last_hash = h
