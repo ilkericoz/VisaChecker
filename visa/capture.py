@@ -1,10 +1,26 @@
 """
-Manual capture mode: launches Chrome, opens the Istanbul booking page,
-and records everything (network, screenshots, DOM) while you do the booking
-manually. Run with: python -m visa.capture [city]
+Manual capture mode: launches Chrome, opens the booking page, and records
+EVERYTHING (network + headers, console, dialogs, navigations, and a DOM+screenshot
+snapshot on every structural change) while you do the booking by hand.
+
+Run with: python -m visa.capture [city]
   city: Istanbul (default) or Ankara
+
+Design constraints (important):
+  * We NEVER inject observers/expose_function/window overrides into the page.
+    Those trip Cloudflare bot detection and have cost real slots before. The only
+    init script is the standard automation-marker scrub (it removes signals, it
+    does not add any). Everything else is captured out-of-band via CDP (screenshots,
+    DOM serialization) or via passive Playwright event listeners — none of which the
+    page can see.
+  * Popups here (SweetAlert "Emin misiniz?", result dialogs) are pure client-side
+    JS and make NO network request, so they can only be caught by watching the DOM.
+    We poll ~1.5s and snapshot on every structural change, so an opening/closing
+    dialog is captured both as HTML and as a screenshot.
+  * The bundle is auto-saved every few seconds, so a hard kill can't wipe it.
 """
 import asyncio
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -18,6 +34,9 @@ from visa.telegram import send_telegram, send_telegram_photo
 
 
 BASE_DIR = Path(".")
+POLL_SECONDS = 1.5          # DOM/dialog poll cadence
+HEARTBEAT_EVERY = 8         # force a timelapse screenshot every N idle ticks
+AUTOSAVE_EVERY = 4          # write the bundle every N ticks (~6s)
 
 
 def _bundle_path(city: str) -> str:
@@ -48,41 +67,62 @@ async def run_capture(city: str = "Istanbul"):
         print("[Capture] Could not launch Chrome.")
         return
 
+    # ── Everything we record ────────────────────────────────────────────────
     requests_log = []
     responses_log = []
+    console_log = []
+    dialogs_log = []       # native JS dialogs (alert/confirm/beforeunload)
+    popups_log = []        # new tabs/windows
+    navigations_log = []
+    dom_snapshots = []     # {ts, url, file, changed_because, has_dialog}
     screenshots = []
+    cookies_snapshot = []
     shot_count = [0]
+    snap_count = [0]
 
-    async def _screenshot(page, label=""):
-        try:
-            shot_count[0] += 1
-            path = f"{base}.shot{shot_count[0]:03d}_{label}.png" if label else f"{base}.shot{shot_count[0]:03d}.png"
-            await page.screenshot(path=path, full_page=True)
-            screenshots.append({"n": shot_count[0], "label": label, "path": path, "url": page.url})
-            print(f"[Capture] Screenshot #{shot_count[0]}: {label or page.url[:80]}")
-            return path
-        except Exception as e:
-            print(f"[Capture] Screenshot failed: {e}")
-            return None
-
-    def _save_bundle():
+    def _save_bundle(note=""):
         bundle = {
             "city": city,
             "booking_url": booking_url,
+            "saved_at": datetime.now().isoformat(),
+            "note": note,
             "requests": requests_log,
             "responses": responses_log,
+            "console": console_log,
+            "dialogs": dialogs_log,
+            "popups": popups_log,
+            "navigations": navigations_log,
+            "dom_snapshots": dom_snapshots,
             "screenshots": screenshots,
+            "cookies": cookies_snapshot,
         }
-        path = f"{base}.capture.json"
-        Path(path).write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[Capture] Bundle saved: {path}")
+        try:
+            Path(f"{base}.capture.json").write_text(
+                json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"[Capture] Bundle save failed: {e}")
+
+    async def _screenshot(page, label="", full_page=True):
+        try:
+            shot_count[0] += 1
+            path = f"{base}.shot{shot_count[0]:03d}_{label}.png" if label else f"{base}.shot{shot_count[0]:03d}.png"
+            await page.screenshot(path=path, full_page=full_page)
+            screenshots.append({
+                "n": shot_count[0], "ts": datetime.now().isoformat(),
+                "label": label, "path": path, "url": page.url,
+            })
+            return path
+        except Exception as e:
+            print(f"[Capture] Screenshot failed ({label}): {e}")
+            return None
 
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(cdp_url(config))
         ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = await ctx.new_page()
 
-        # Scrub Playwright automation markers — same as booker.py.
+        # Automation-marker scrub ONLY (removes signals, adds none) — same as booker.py.
         await page.add_init_script("""
             try { delete window.__playwright; } catch(e) {}
             try { delete window.__pwInitScripts; } catch(e) {}
@@ -90,17 +130,22 @@ async def run_capture(city: str = "Istanbul"):
             try { delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise; } catch(e) {}
         """)
 
-        # ── Network capture ────────────────────────────────────────────────
+        # ── Network capture (with full headers) ─────────────────────────────
         def _on_request(req):
-            entry_r = {
+            try:
+                headers = dict(req.headers)
+            except Exception:
+                headers = {}
+            requests_log.append({
                 "ts": datetime.now().isoformat(),
                 "method": req.method,
                 "url": req.url,
+                "resource_type": req.resource_type,
+                "headers": headers,
                 "post_data": req.post_data or "",
-            }
-            requests_log.append(entry_r)
+            })
             if req.method == "POST":
-                print(f"[Capture] POST → {req.url[:80]}")
+                print(f"[Capture] POST -> {req.url[:90]}")
 
         async def _on_response(resp):
             if "as-visa.com" not in resp.url:
@@ -109,68 +154,165 @@ async def run_capture(city: str = "Istanbul"):
                 body = (await resp.body()).decode("utf-8", errors="replace")
             except Exception:
                 body = ""
-            # Keep the full body for the booking-page HTML AND for the site's JS.
-            # The submit-button wiring and the "Emin misiniz?" SweetAlert flow are
-            # pure client-side JS (they make no network request of their own), and
-            # they usually live in an external /PageJs/*.js file rather than inline —
-            # so we must retain full JS bodies to see how the automated submit works.
-            # Everything else is capped so the bundle doesn't balloon.
+            try:
+                headers = dict(resp.headers)
+            except Exception:
+                headers = {}
+            # Keep FULL bodies for the booking-page HTML and for JS (inline or
+            # external /PageJs/*.js) — the submit button + dialog wiring lives there.
+            # Cap everything else so the bundle stays reasonable.
             u = resp.url.lower()
             keep_full = (
                 u.rstrip("/").endswith("bireysel-basvuru")
                 or u.endswith(".js")
                 or "/pagejs/" in u
             )
-            entry_r = {
+            responses_log.append({
                 "ts": datetime.now().isoformat(),
                 "status": resp.status,
                 "url": resp.url,
+                "headers": headers,
                 "body": body if keep_full else body[:4000],
-            }
-            responses_log.append(entry_r)
+            })
             if resp.request.method == "POST":
-                print(f"[Capture] Response {resp.status} ← {resp.url[:80]}")
+                print(f"[Capture] Response {resp.status} <- {resp.url[:80]}")
                 print(f"[Capture]   body: {body[:200]}")
+
+        # ── Passive listeners (page can't see any of these) ─────────────────
+        def _on_console(msg):
+            try:
+                console_log.append({
+                    "ts": datetime.now().isoformat(),
+                    "type": msg.type, "text": msg.text,
+                })
+            except Exception:
+                pass
+
+        def _on_pageerror(err):
+            console_log.append({
+                "ts": datetime.now().isoformat(),
+                "type": "pageerror", "text": str(err),
+            })
+
+        async def _on_dialog(dialog):
+            # Native JS dialogs only (SweetAlert is NOT native — handled by DOM poll).
+            dialogs_log.append({
+                "ts": datetime.now().isoformat(),
+                "type": dialog.type, "message": dialog.message,
+            })
+            print(f"[Capture] NATIVE DIALOG ({dialog.type}): {dialog.message[:120]}")
+            try:
+                await dialog.accept()   # don't block the user's flow
+            except Exception:
+                pass
+
+        def _on_popup(new_page):
+            popups_log.append({
+                "ts": datetime.now().isoformat(),
+                "url": getattr(new_page, "url", ""),
+            })
+            print(f"[Capture] POPUP/new tab: {getattr(new_page, 'url', '')[:90]}")
+
+        def _on_framenav(frame):
+            try:
+                if frame == page.main_frame:
+                    navigations_log.append({
+                        "ts": datetime.now().isoformat(), "url": frame.url,
+                    })
+                    print(f"[Capture] NAV -> {frame.url[:90]}")
+            except Exception:
+                pass
+
+        def _on_reqfailed(req):
+            requests_log.append({
+                "ts": datetime.now().isoformat(),
+                "method": req.method, "url": req.url,
+                "failed": (req.failure or ""),
+            })
 
         page.on("request", _on_request)
         page.on("response", lambda r: asyncio.ensure_future(_on_response(r)))
+        page.on("console", _on_console)
+        page.on("pageerror", _on_pageerror)
+        page.on("dialog", lambda d: asyncio.ensure_future(_on_dialog(d)))
+        page.on("popup", _on_popup)
+        page.on("framenavigated", _on_framenav)
+        page.on("requestfailed", _on_reqfailed)
 
-        # ── Navigate to booking page ───────────────────────────────────────
+        # ── Navigate to booking page ────────────────────────────────────────
         print(f"[Capture] Navigating to {booking_url} ...")
         await page.goto(booking_url, timeout=30_000)
 
         send_telegram(
             f"Manual capture started — {city}\n"
-            "Go ahead and fill + submit the form. Everything is being recorded."
+            "Fill + submit the form yourself. Every popup, request, console line and "
+            "DOM change is being recorded, and the bundle auto-saves every few seconds."
         )
         print("\n[Capture] *** Browser is open. Do the booking manually. ***")
-        print("[Capture] Press Ctrl+C here when done to save the full bundle.\n")
+        print("[Capture] Everything auto-saves; Ctrl+C or close the tab when done.\n")
 
-        # Periodic screenshot every 30s while on the booking page
-        async def _periodic():
+        # ── Main watch loop: snapshot on every structural change ────────────
+        async def _watch():
+            last_hash = None
+            idle_ticks = 0
+            tick = 0
             while True:
-                await asyncio.sleep(30)
-                if "as-visa.com" in page.url:
+                await asyncio.sleep(POLL_SECONDS)
+                tick += 1
+                if "as-visa.com" not in (page.url or ""):
+                    continue
+                try:
+                    dom = await page.content()
+                except Exception:
+                    continue
+
+                h = hashlib.md5(dom.encode("utf-8", "replace")).hexdigest()
+                # A SweetAlert / modal presence is detectable purely from the DOM
+                # string we already have — no extra in-page call needed.
+                low = dom.lower()
+                has_dialog = ("swal2-popup" in low or "swal2-container" in low
+                              or "modal show" in low or 'role="dialog"' in low)
+
+                if h != last_hash:
+                    last_hash = h
+                    idle_ticks = 0
+                    snap_count[0] += 1
+                    ts = datetime.now().strftime("%H%M%S_%f")[:-3]
+                    dom_file = f"{base}.dom_{snap_count[0]:03d}_{ts}.html"
                     try:
-                        shot_count[0] += 1
-                        path = f"{base}.shot{shot_count[0]:03d}_periodic.png"
-                        await page.screenshot(path=path, full_page=False)
-                        screenshots.append({"n": shot_count[0], "label": "periodic", "path": path, "url": page.url})
+                        Path(dom_file).write_text(dom, encoding="utf-8")
+                    except Exception:
+                        dom_file = ""
+                    dom_snapshots.append({
+                        "n": snap_count[0], "ts": datetime.now().isoformat(),
+                        "url": page.url, "file": dom_file, "has_dialog": has_dialog,
+                    })
+                    # Full-page screenshot for every distinct state (captures popups).
+                    label = "dialog" if has_dialog else "state"
+                    await _screenshot(page, f"{label}{snap_count[0]:03d}", full_page=True)
+                    if has_dialog:
+                        print(f"[Capture] *** DIALOG/modal in DOM — snapshot #{snap_count[0]} ***")
+                        shot = screenshots[-1]["path"] if screenshots else None
+                        if shot:
+                            try:
+                                send_telegram_photo(shot, caption=f"Popup captured ({city})")
+                            except Exception:
+                                pass
+                else:
+                    idle_ticks += 1
+                    if idle_ticks % HEARTBEAT_EVERY == 0:
+                        await _screenshot(page, "heartbeat", full_page=False)
+
+                # Refresh cookies + autosave periodically so a hard kill loses little.
+                if tick % AUTOSAVE_EVERY == 0:
+                    try:
+                        cookies_snapshot.clear()
+                        cookies_snapshot.extend(await ctx.cookies())
                     except Exception:
                         pass
-                    # Snapshot the LIVE rendered form DOM while we're on the booking
-                    # page. The final DOM dump only fires on close (which lands on the
-                    # confirmation page), so without this we never capture the form's
-                    # actual submit button / dialog markup. Overwrite one file so we
-                    # always keep the most recent pre-submit form state.
-                    if page.url.rstrip("/").endswith("bireysel-basvuru"):
-                        try:
-                            form_dom = await page.content()
-                            Path(f"{base}.form_dom.html").write_text(form_dom, encoding="utf-8")
-                        except Exception:
-                            pass
+                    _save_bundle(note="autosave")
 
-        periodic_task = asyncio.ensure_future(_periodic())
+        watch_task = asyncio.ensure_future(_watch())
 
         try:
             await page.wait_for_event("close", timeout=0)
@@ -180,16 +322,28 @@ async def run_capture(city: str = "Istanbul"):
         except Exception:
             pass
         finally:
-            periodic_task.cancel()
-            # Final DOM + screenshot
+            watch_task.cancel()
+            # Final DOM + full-page screenshot + cookies + save.
             try:
                 dom = await page.content()
                 Path(f"{base}.final.dom.html").write_text(dom, encoding="utf-8")
             except Exception:
                 pass
-            await _screenshot(page, "final")
-            _save_bundle()
-            send_telegram(f"Manual capture complete. Bundle: capture_{city}_{Path(base).name.split('_', 2)[-1]}")
+            await _screenshot(page, "final", full_page=True)
+            try:
+                cookies_snapshot.clear()
+                cookies_snapshot.extend(await ctx.cookies())
+            except Exception:
+                pass
+            _save_bundle(note="final")
+            print(f"[Capture] Bundle saved: {base}.capture.json "
+                  f"({len(requests_log)} req, {len(responses_log)} resp, "
+                  f"{len(dom_snapshots)} DOM snaps, {len(screenshots)} shots)")
+            send_telegram(
+                f"Manual capture complete ({city}). "
+                f"{len(dom_snapshots)} DOM snapshots, {len(screenshots)} screenshots, "
+                f"{len([d for d in dom_snapshots if d['has_dialog']])} with a popup on screen."
+            )
 
 
 def main():
